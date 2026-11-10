@@ -146,6 +146,15 @@ create trigger if not exists claims_au_sense after update of content on claims b
   delete from claim_sense where claim_id = new.id;
 end;
 """
+# Chinese and Japanese keywords for the claims (mem.chunk_cjk's twin): kept exactly as claim_fts is, a claim with CJK
+# only. Its own script, so a store made before it gets it too (mem._cjk_index_once).
+CJK_SCHEMA = """
+create virtual table if not exists claim_cjk using fts5(text);
+create trigger if not exists claims_ad_cjk after delete on claims begin
+  delete from claim_cjk where rowid = old.id;
+end;
+"""
+SCHEMA += CJK_SCHEMA
 
 
 # ---------- the tables ----------
@@ -226,15 +235,25 @@ def _vectors(db, ids):
         f"select rowid, embedding from claim_vec where rowid in ({','.join('?' * len(ids))})", list(ids))}
 
 
-def _index(db, cid, content, vec):
+def _keywords(db, cid, content=None):
+    """A claim's keyword rows: claim_fts, and claim_cjk for one with Chinese or Japanese. content None: removed."""
+    from . import cjk
     db.execute("delete from claim_fts where rowid = ?", (cid,))
+    db.execute("delete from claim_cjk where rowid = ?", (cid,))
+    if content is not None:
+        db.execute("insert into claim_fts(rowid, text) values (?, ?)", (cid, content))
+        if cjk.index_text(content):
+            db.execute("insert into claim_cjk(rowid, text) values (?, ?)", (cid, cjk.index_text(content)))
+
+
+def _index(db, cid, content, vec):
+    _keywords(db, cid, content)
     db.execute("delete from claim_vec where rowid = ?", (cid,))
-    db.execute("insert into claim_fts(rowid, text) values (?, ?)", (cid, content))
     db.execute("insert into claim_vec(rowid, embedding) values (?, ?)", (cid, vec.tobytes()))
 
 
 def _unindex(db, cid):
-    db.execute("delete from claim_fts where rowid = ?", (cid,))
+    _keywords(db, cid)
     db.execute("delete from claim_vec where rowid = ?", (cid,))
 
 
@@ -413,7 +432,7 @@ def _hold(db, ids):
     every search reads active claims only. Caller holds the transaction."""
     for cid in ids:
         db.execute("update claims set status = 'held' where id = ? and status = 'active'", (cid,))
-        db.execute("delete from claim_fts where rowid = ?", (cid,))
+        _keywords(db, cid)
     return list(ids)
 
 
@@ -450,8 +469,7 @@ def unhold(m, db, ids, reindex=True):
             continue
         db.execute("update claims set status = 'active' where id = ?", (r["id"],))
         if reindex:
-            db.execute("delete from claim_fts where rowid = ?", (r["id"],))
-            db.execute("insert into claim_fts(rowid, text) values (?, ?)", (r["id"], r["content"]))
+            _keywords(db, r["id"], r["content"])
 
 
 def forget_claim(m, db, cid, scope=None):
@@ -1179,6 +1197,12 @@ def search(m, db, query, k=8, hide=(), exclude=(), scores=None):
         for i, r in enumerate(db.execute("select rowid from claim_fts where claim_fts match ? order by rank limit ?",
                                          (fq, m.POOL_FTS * wide))):
             rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
+    from . import cjk
+    cq = cjk.fts_query(query)  # Chinese or Japanese: their bigrams; "" for any other query
+    if cq:
+        for i, r in enumerate(db.execute("select rowid from claim_cjk where claim_cjk match ? order by rank limit ?",
+                                         (cq, m.POOL_FTS * wide))):
+            rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
     ids = [i for i in sorted(rrf, key=rrf.get, reverse=True) if i not in exclude]
     rows = [r for r in _rows(db, ids) if allowed(m, db, r, hide)][:max(k, m.CANDIDATES)]
     if not rows:
@@ -1326,7 +1350,7 @@ def context(m, db, prompt, scope, used_chars, mem_sent, session_id=None, memo=No
     if not ready(db) or sweep_pending(db) or m.not_asked(prompt):
         return [], st
     prompt = m.STAMP_RE.sub("", prompt).strip()
-    if len(prompt.split()) < 3:
+    if m._cjk().words(prompt) < 3:
         return [], st
     hide = m.RESTRICTED.get(scope, ())
     seen = {r[0] for r in db.execute("select claim_id from claim_injections where session_id = ?",

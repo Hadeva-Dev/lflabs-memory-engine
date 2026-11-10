@@ -311,6 +311,12 @@ create trigger if not exists chunks_ad after delete on chunks begin
   insert into chunk_fts(chunk_fts, rowid, text) values ('delete', old.id, old.text);
   delete from chunk_vec where rowid = old.id;
 end;
+-- Chinese and Japanese keywords (cjk.py): the default tokenizer reads an unspaced CJK clause as one word, so a chunk
+-- with CJK also has its bigrams here (cjk.index_text, written by _index). The row goes with its chunk.
+create virtual table if not exists chunk_cjk using fts5(text);
+create trigger if not exists chunks_ad_cjk after delete on chunks begin
+  delete from chunk_cjk where rowid = old.id;
+end;
 create trigger if not exists memories_ad after delete on memories begin
   delete from chunks where memory_id = old.id;
   delete from mem_vec where rowid = old.id;
@@ -345,6 +351,10 @@ create virtual table if not exists convo_vec using vec0(embedding float[{DIM}] d
 create trigger if not exists convo_chunks_ai after insert on convo_chunks begin
   insert into convo_fts(rowid, text) values (new.id, new.text);
 end;
+create virtual table if not exists convo_cjk using fts5(text);  -- as chunk_cjk, for chat chunks with CJK
+create trigger if not exists convo_chunks_ad_cjk after delete on convo_chunks begin
+  delete from convo_cjk where rowid = old.id;
+end;
 create trigger if not exists convo_chunks_ad after delete on convo_chunks begin
   insert into convo_fts(convo_fts, rowid, text) values ('delete', old.id, old.text);
   delete from convo_vec where rowid = old.id;
@@ -374,6 +384,7 @@ def connect():
     db.execute("pragma secure_delete = on")  # deleted text is overwritten in the file, not left in free pages
     db.executescript(SCHEMA)
     _migrate(db)
+    _cjk_index_once(db)
     _secure_fts(db)
     _erase_forgotten_once(db)
     _generic_names_once(db)
@@ -387,7 +398,48 @@ def connect():
 
 def _fts_tables(db):
     return [r[0] for r in db.execute("select name from sqlite_master where type = 'table' and name in"
-                                     " ('chunk_fts', 'convo_fts', 'claim_fts')")]
+                                     " ('chunk_fts', 'convo_fts', 'claim_fts', 'chunk_cjk', 'convo_cjk', 'claim_cjk')")]
+
+
+def _cjk():
+    from . import cjk
+    return cjk
+
+
+CJK_TABLES = (("chunk_cjk", "chunks", "text"), ("convo_cjk", "convo_chunks", "text"), ("claim_cjk", "claims", "content"))
+
+
+def _cjk_index_once(db):
+    """The CJK keyword tables, filled once for a store made before them (engine 0.1.5): every chunk, chat chunk and
+    active claim with Chinese or Japanese in it. Rows only for text with CJK; English is never read twice."""
+    if _claims_ready(db):
+        db.executescript(_claims_mod().CJK_SCHEMA)
+    row = db.execute("select value from meta where key = 'cjk_index_v1'").fetchone()
+    done = set((row[0] if row else "").split(","))
+    have = {r[0] for r in db.execute("select name from sqlite_master where type = 'table'")}
+    todo = [t for t in CJK_TABLES if t[0] not in done and t[0] in have and t[1] in have]
+    if not todo:
+        return
+    cj = _cjk()
+    with db:
+        for fts, table, col in todo:
+            where = " where status = 'active'" if table == "claims" else ""
+            for rid, text in db.execute(f"select id, {col} from {table}{where}").fetchall():
+                terms = cj.index_text(text)
+                if terms:
+                    db.execute(f"delete from {fts} where rowid = ?", (rid,))
+                    db.execute(f"insert into {fts}(rowid, text) values (?, ?)", (rid, terms))
+        db.execute("insert or replace into meta values ('cjk_index_v1', ?)",
+                   (",".join(sorted((done - {""}) | {t[0] for t in todo})),))
+
+
+def cjk_index(db, table, rid, text):
+    """A row's CJK keywords (cjk.index_text) in its cjk table; nothing for text without CJK. Caller holds the
+    transaction."""
+    terms = _cjk().index_text(text)
+    if terms:
+        db.execute(f"delete from {table} where rowid = ?", (rid,))
+        db.execute(f"insert into {table}(rowid, text) values (?, ?)", (rid, terms))
 
 
 def _secure_fts(db):
@@ -505,6 +557,7 @@ def _index(db, mid, content, mem_vec=None):
     for i, (t, v) in enumerate(zip(texts, vecs)):
         cid = db.execute("insert into chunks(memory_id, ord, text) values (?,?,?)", (mid, i, t)).lastrowid
         db.execute("insert into chunk_vec(rowid, embedding) values (?, ?)", (cid, v.tobytes()))
+        cjk_index(db, "chunk_cjk", cid, t)
 
 
 def _active(db, ids):
@@ -1135,6 +1188,59 @@ CLIENT_ENV, CLIENT_KEY_ENV = "LFLABS_MEMORY_CLIENT", "LFLABS_MEMORY_CLIENT_KEY" 
 def client_env():
     """(the client name, its key) a hook or MCP server was started with, or (None, None)."""
     return os.environ.get(CLIENT_ENV) or None, os.environ.get(CLIENT_KEY_ENV) or None
+
+
+CLAUDE_HOOK_EVENTS = {"UserPromptSubmit", "SessionStart", "Stop", "SubagentStop", "SessionEnd", "PreCompact",
+                      "PreToolUse", "PostToolUse", "Notification"}
+
+
+def _under(path, root):
+    try:
+        return Path(path).expanduser().resolve().is_relative_to(Path(root).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def hook_app(data):
+    """Whose hook call this payload is, from what the app itself sends: "desk" (Claude Code) for a transcript at
+    ~/.claude/projects/<folder>/<session id>.jsonl with one of Claude Code's hook events and none of Cursor's fields;
+    "codex" for a transcript under ~/.codex/sessions; None for anything else (no transcript, Cursor's, any other)."""
+    tp, sid = data.get("transcript_path"), data.get("session_id")
+    if not isinstance(tp, str) or not tp.strip():
+        return None
+    if _under(tp, CODEX_SESSIONS):
+        return "codex"
+    try:
+        real = Path(tp).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    roots = {Path(CLAUDE_PROJECTS).resolve()}
+    if os.environ.get("CLAUDE_CONFIG_DIR"):  # Claude Code keeps its transcripts there when the user moved its folder
+        roots.add((Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser() / "projects").resolve())
+    if isinstance(sid, str) and real.name == f"{sid}.jsonl" and real.parent.parent in roots \
+            and data.get("hook_event_name") in CLAUDE_HOOK_EVENTS and "conversation_id" not in data \
+            and "workspace_roots" not in data:
+        return "desk"
+    return None
+
+
+def hook_client(data):
+    """((name, verified), what to send the daemon as "client" or None) for a hook call: prompt, session start, Stop.
+    Never Claude Code's whole memory for want of a name (v0.1.8-rc2 gate, 2026-11-10: Codex's prompt hook with its
+    LFLABS_MEMORY_CLIENT taken out was read as Claude Code's and given a personal note). The payload decides
+    (hook_app), and the name the hook was started with can only narrow it: Claude Code's own hook may run as another
+    client; a Codex transcript is Codex's whatever name it gives (its key counts only under its own name); anything
+    else is the client it names (a name alone: work only) or unknown (work only)."""
+    name, key = client_env()
+    app = hook_app(data)
+    if app == "desk" and name in (None, "desk"):
+        return ("desk", True), None
+    if app == "codex":
+        name, key = "codex", key if name in (None, "codex") else None
+    elif not name:
+        name, key = "unknown", None
+    sent = {"name": name, "key": key}
+    return client_from_request(sent), sent
 CLIENT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 # Health and money are one pseudo-section (WITHHELD, the word list or the labels); chats is search_chats' index of past
 # Claude Code conversations, which can hold anything.
@@ -1911,13 +2017,17 @@ def english_screenable(text):
 
 # A first-person note about the user's own life in Chinese or Japanese (clean-VM CJK test: "我有哮喘，随身带着吸入器",
 # "私は高血圧で、毎朝薬を飲んでいます" were filed under projects): 我 / 私 / 僕 / 俺 (not 我们, "we") and a health, family,
-# money or legal word.
-PERSONAL_CJK_RE = re.compile(
-    r"(?:我(?!们|們)|私(?!たち|達|ども)|僕(?!ら|たち)|俺(?!ら|たち)|わたし(?!たち)|自分)[^。！？\n]{0,40}?(?:"
+# money or legal word. Both languages often leave the "I" out: a note that opens with the user's own kin ("母が入院して
+# いる", "妈妈住院了": 母 is one's own mother) and has such a word is theirs too.
+_CJK_PERSONAL_WORDS = (
     r"痛|服用|服药|吃药|処方|处方|症状|発作|癫痫|てんかん|血糖|インスリン|胰岛素|怪我|受伤|精神科|心理|哮喘|喘息|吸入器|高血压|高血圧|血压|血圧|糖尿病|病|药|薬|医生|医院|医者|病院|诊断|診断|手术|手術|怀孕|妊娠|抑郁|うつ|焦虑|"
-    r"癌|过敏|過敏|アレルギー|治疗|治療|看病|体检|健診|妻子|老婆|丈夫|老公|妻|夫|彼氏|彼女|男朋友|女朋友|离婚|離婚|分手|别れ|"
-    r"孩子|儿子|女儿|子供|息子|娘|父母|母亲|父亲|妈妈|爸爸|母|父|家族|家人|工资|薪水|給料|年収|贷款|房贷|ローン|借金|债|"
-    r"存款|貯金|律师|弁護士|法院|裁判|官司|诉讼|訴訟|签证|ビザ)", re.I)
+    r"癌|过敏|過敏|アレルギー|治疗|治療|看病|体检|健診|入院|住院|通院|失眠|不眠|妻子|老婆|丈夫|老公|妻|夫|彼氏|彼女|男朋友|女朋友|离婚|離婚|別居|分居|分手|别れ|"
+    r"孩子|儿子|女儿|子供|息子|娘|父母|母亲|父亲|妈妈|爸爸|母|父|家族|家人|工资|薪水|給料|年収|贷款|房贷|ローン|借金|债|欠|信用卡|"
+    r"存款|貯金|律师|弁護士|法院|出庭|开庭|裁判|官司|诉讼|訴訟|签证|ビザ")
+PERSONAL_CJK_RE = re.compile(
+    r"(?:(?:我(?!们|們)|私(?!たち|達|ども)|僕(?!ら|たち)|俺(?!ら|たち)|わたし(?!たち)|自分)[^。！？\n]{0,40}?"
+    r"|^\s*(?:母|父|妻|夫|息子|娘|両親|家内|主人|妈妈|爸爸|妈|爸|老婆|老公|妻子|丈夫|儿子|女儿|父母)(?:が|は|の|も)?"
+    r"[^。！？\n]{0,30}?)(?:" + _CJK_PERSONAL_WORDS + ")", re.I)
 
 
 def app_kind(kind, scope):
@@ -1969,8 +2079,11 @@ def app_remember(db, content, kind=None, project=None, via=None, scope=None, ver
         print(f"{SERVER_NAME}: sense label not made now: {type(e).__name__}", file=sys.stderr)
     row = db.execute("select * from memories where id = ?", (mid,)).fetchone()
     sec = row["section"] or "unfiled"
-    seen = "every connected app can see it" if sec in WORK_ONLY and (row["section2"] or sec) in WORK_ONLY else \
-        "only apps allowed personal memories can see it, not apps set to work only"
+    # what a work-only app is shown: its sections, less health and money (the labels, else the word list): a health
+    # note the rules filed under projects is hidden from it all the same (clean-VM CJK test, 2026-11-09: such a note's
+    # reply said every connected app could see it)
+    seen = "every connected app can see it" if sec in WORK_ONLY and (row["section2"] or sec) in WORK_ONLY \
+        and not _withheld(row) else "only apps allowed personal memories can see it, not apps set to work only"
     out = f"{action} memory #{mid} (filed under {sec}: {seen})"
     if held_back(row):
         out += (f". It is saved for search: it reaches other apps' prompts only after the user confirms it by typing "
@@ -2325,6 +2438,12 @@ def search(db, query, k=8, exclude=(), boost=(), only=(), hide=(), writers=False
                 "select rowid from chunk_fts where chunk_fts match ?" + (f" and +{mine}" if mine else "")  # +: kept out
                 # of FTS5's index, which would otherwise run the match once per allowed row (12 s on 3k chunks)
                 + " order by rank limit ?", (fq, POOL_FTS * wide))):
+            rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
+    cq = _cjk().fts_query(query)  # Chinese or Japanese: their bigrams (chunk_cjk); "" for any other query
+    if cq:
+        for i, r in enumerate(db.execute("select rowid from chunk_cjk where chunk_cjk match ?"
+                                         + (f" and +{mine}" if mine else "") + " order by rank limit ?",
+                                         (cq, POOL_FTS * wide))):
             rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
     if not rrf:
         return []
@@ -2683,7 +2802,7 @@ def scrub_backups(mem_ids, claim_ids=(), folder=None):
             dst.enable_load_extension(False)
             dst.execute("pragma secure_delete = on")
             tables = {r[0] for r in dst.execute("select name from sqlite_master where type = 'table'")}
-            for t in ("chunk_fts", "claim_fts"):
+            for t in ("chunk_fts", "claim_fts", "chunk_cjk", "claim_cjk"):
                 if t in tables:
                     dst.execute(f"insert into {t}({t}, rank) values('secure-delete', 1)")
             gone = 0
@@ -2775,6 +2894,8 @@ def _generic_names_once(db):
                                           (new, _hash(new), cid)).rowcount:
                 db.execute("insert into convo_fts(convo_fts, rowid, text) values ('delete', ?, ?)", (cid, text))
                 db.execute("insert into convo_fts(rowid, text) values (?, ?)", (cid, new))
+                if db.execute("select 1 from sqlite_master where name = 'convo_cjk'").fetchone():
+                    cjk_index(db, "convo_cjk", cid, new)
         if "holdout" in tables:
             for col in [r[1] for r in db.execute("pragma table_info(holdout)") if _sha(r[1]) == LEGACY_HOLDOUT]:
                 db.execute(f"alter table holdout rename column {col} to owner_lines")
@@ -4594,7 +4715,7 @@ def similar(partial, final):
 def prefetch(db, text, session_id, cwd=None, now=None):
     """Run the recall search for a partial transcript now and keep it for this session's next prompt. cwd: the
     session's folder, as its hook will report it (the host sends its voice brain's)."""
-    if not session_id or len(text.split()) < 3:
+    if not session_id or _cjk().words(text) < 3:
         return False
     seen, scope = _seen(db, session_id), scope_of(session_id)
     hide, boost = RESTRICTED.get(scope, ()), context_sections(cwd, session_id, text, scope)
@@ -4739,8 +4860,12 @@ def gate(db, prompt, hits, scope=None, min_logit=None, memo=None):
     says the prompt likely wants no memory, only strong matches (need.strong_logit) go in. min_logit: another cut
     (the learning-from-use shadow gate's); memo: a dict that keeps the needs-memory answer for a second call."""
     g = gate_params() if GATE == "calibrated" else None
+    qterms = _cjk().terms(prompt) if _cjk().has(prompt) else None
+    if qterms is not None:  # a Chinese or Japanese question: a CJK memory is judged by the words it shares
+        hits, by_words = _cjk_evidence(prompt, qterms, hits)
     if g is None:
-        return [h for h in hits if h["score"] >= (RERANK_MIN if min_logit is None else min_logit)]
+        keep = [h for h in hits if h["score"] >= (RERANK_MIN if min_logit is None else min_logit)]
+        return _with_evidence(keep, by_words) if qterms is not None else keep
     keep = [h for h in hits if h["score"] >= (g["min_logit"] if min_logit is None else min_logit)]
     # A prompt about the user ("what do I usually get", "my husband's birthday") always gets its matches: on a small
     # store the need model held back exactly those (2026-10-15), and exempting first-person prompts cost nothing
@@ -4755,7 +4880,32 @@ def gate(db, prompt, hits, scope=None, min_logit=None, memo=None):
             p = memo["need"]
         if p < g["need"]["min"]:
             keep = [h for h in keep if h["score"] >= g["need"]["strong_logit"]]
-    return keep
+    return _with_evidence(keep, by_words) if qterms is not None else keep
+
+
+# The cross-encoder (ms-marco-MiniLM, English) scores any Chinese or Japanese pair alike: on the clean-VM CJK facts every
+# CJK memory scored +3 to +8 against every CJK question, the one asked about or not, and against a question that needs no
+# memory, so its logit is no evidence for a CJK memory (2026-11-09). A CJK memory reaches a CJK question's prompt when
+# it shares enough of the question's words instead (cjk.evidence: bigrams and Latin words), and only then; a memory
+# with no CJK in it is judged by the logit as always. Measured on those 15 facts: the fact asked in its own words
+# shares 4 to 12 terms, any other fact 0 to 2, and the six silence prompts 0 with every fact.
+
+def _cjk_evidence(prompt, qterms, hits):
+    """(the hits the logit judges, the CJK ones that share enough words): the rest are dropped."""
+    cj = _cjk()
+    judged, by_words = [], []
+    for h in hits:
+        text = h.get("chunk") or h.get("content") or ""
+        if not cj.has(text):
+            judged.append(h)
+        elif cj.evidence(qterms, text) or (h.get("content") and cj.evidence(qterms, h["content"])):
+            by_words.append(h)
+    return judged, by_words
+
+
+def _with_evidence(keep, by_words):
+    """The gate's English-judged hits and the CJK ones with evidence, best first: a CJK one by the words it shares."""
+    return sorted(keep + by_words, key=lambda h: h["score"], reverse=True) if by_words else keep
 
 
 # ---------- learning from use (the bench's wedge study): the gate, corrected from the user's own use, in shadow ----------
@@ -5650,7 +5800,7 @@ def prompt_context(db, prompt, session_id=None, cwd=None, scope=None, count=True
     lines, passed, claimed, rows, parts, n_claims, recall_chars = [], [], [], {}, _lean_parts(), 0, 0
     head = CONTEXT_HEAD_LEAN if "labels" in parts else CONTEXT_HEAD
     wide = followup_widened(prompt, prev, scope, cwd)  # FOLLOWUP_MODE: a vague follow-up with the turn before it
-    if len(prompt.split()) >= 3:
+    if _cjk().words(prompt) >= 3:  # an unspaced Chinese or Japanese question counts a word per two characters
         seen = _seen(db, session_id)
         asked = []
         for query in ((prompt, wide) if wide is not prompt else (prompt,)):  # the prompt alone first, as always; the
@@ -5762,7 +5912,7 @@ def followup_kind(prompt):
     """"short" (under three words, never searched today), "vague" (three to FOLLOWUP_VAGUE words with no capitalised
     name in them and no one from the people index), "brief" (as many words, naming someone: "what about Hana's?"), or
     None (a full prompt, searched well on its own)."""
-    n = len(prompt.split())
+    n = _cjk().words(prompt)
     if n < 3:
         return "short" if n else None
     if n > FOLLOWUP_VAGUE:
@@ -6738,6 +6888,7 @@ def _index_transcript(db, path, size, mtime, ck, now, budget=None):
                     if cur.rowcount:  # the same exchange copied into a forked session is kept once
                         db.execute("insert into convo_vec(rowid, embedding) values (?, ?)",
                                    (cur.lastrowid, vecs[v].tobytes()))
+                        cjk_index(db, "convo_cjk", cur.lastrowid, c)
                         ordn, added = ordn + 1, added + 1
                     v += 1
             if batch:
@@ -6978,6 +7129,13 @@ def search_chats(db, query, k=6, since_days=None, project=None):
                 "select f.rowid from convo_fts f join convo_chunks c on c.id = f.rowid"
                 " join convos v on v.session_id = c.session_id"
                 f" where convo_fts match ?{where} order by f.rank limit ?", (fq, *params, CHAT_POOL))):
+            rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
+    cq = _cjk().fts_query(query)
+    if cq:
+        for i, r in enumerate(db.execute(
+                "select f.rowid from convo_cjk f join convo_chunks c on c.id = f.rowid"
+                " join convos v on v.session_id = c.session_id"
+                f" where convo_cjk match ?{where} order by f.rank limit ?", (cq, *params, CHAT_POOL))):
             rrf[r["rowid"]] = rrf.get(r["rowid"], 0) + 1 / (60 + i)
     if not rrf:
         return []
@@ -7741,6 +7899,7 @@ def hook_prompt(data):
         return
     req = {"prompt": data.get("prompt") or "", "session_id": data.get("session_id"), "cwd": data.get("cwd"),
            "scope": scope_of(), "count": counts_as_use()}  # this hook's environment: a host marks its chat app's
+    who, sent = hook_client(data)  # Claude Code only on its own transcript, never for want of a name
     talk, say = None, []
     if data.get("session_id") and _typed_waiting(data["session_id"]):  # an earlier prompt's typed command, now in
         try:  # the transcript (Codex has no Stop hook)
@@ -7758,7 +7917,7 @@ def hook_prompt(data):
         try:
             db = connect()
             try:
-                got = ins.typed_line(_self(), db, data, client_env()[0] or "desk")
+                got = ins.typed_line(_self(), db, data, who[0])
             finally:
                 db.close()
         except Exception as e:  # never cost the user their prompt or their recall
@@ -7771,7 +7930,7 @@ def hook_prompt(data):
     if TALK_PERMS_MODE == "on" and TALK_HINT_RE.search(req["prompt"]):  # an access change or a handoff phrase in
         # the user's words, read before any model sees them
         try:
-            said = _access().on_prompt(_self(), data, client_env()[0] or "desk", defer=True)
+            said = _access().on_prompt(_self(), data, who[0], defer=True)
             if said:
                 talk = {**said, "lines": [*((talk or {}).get("lines") or []), *(said.get("lines") or [])]}
         except Exception as e:  # never cost the user their prompt or their recall
@@ -7783,10 +7942,9 @@ def hook_prompt(data):
     if TRANSLATE_MODE == "on":  # a prompt not in English is searched in English too; the call is made here, as the
         req["prompt"] = _facets().hook_translate(_self(), req["prompt"])  # daemon answers one hook at a time
     extra = {}
-    if "on" in (CLIENT_SCOPES_MODE, HANDOFF_MODE) and client_env()[0]:  # another agent's prompt hook
-        req["client"] = {"name": client_env()[0], "key": client_env()[1]}  # (Codex): its config
-        extra["client"] = client_from_request(req["client"])
-    if WHATS_UP_MODE != "off" and client_env()[0] and req["cwd"] and _whatsup().unseen(DB_PATH,
+    if "on" in (CLIENT_SCOPES_MODE, HANDOFF_MODE) and sent is not None:  # another agent's prompt hook (Codex), or
+        req["client"], extra["client"] = sent, who  # one that does not show it is Claude Code's: its own scope
+    if WHATS_UP_MODE != "off" and sent is not None and req["cwd"] and _whatsup().unseen(DB_PATH,
                                                                                                    req["session_id"]):
         req["live"] = extra["live"] = _whatsup().probe(_self(), req["cwd"])  # Codex has no start hook: its first prompt
     if FOLLOWUP_MODE != "off" and data.get("transcript_path") and followup_kind(req["prompt"]) in FOLLOWUP_WIDEN:
@@ -7848,15 +8006,16 @@ def hook_session_start(data):
         db.execute("delete from injections where at < ?", (time.time() - 30 * 86400,))
     import_files(db)
     recent = ""
+    who, _ = hook_client(data)  # Claude Code's block only on its own transcript (hook_client)
     if INSTANT_MODE == "on" and data.get("source") in ("startup", "clear", "compact"):
-        if client_env()[0] in (None, "desk"):  # Claude Code at the desk: the project's lessons and recent saves
+        if who == ("desk", True):  # Claude Code at the desk: the project's lessons and recent saves
             # (LESSONS_MODE); a host's session (Telegram, voice: scope_of) gets none, as it gets no what's-up block
-            recent = _start_block(db, data.get("cwd"), client_env(), data.get("session_id")) \
+            recent = _start_block(db, data.get("cwd"), who, data.get("session_id")) \
                 if scope_of(data.get("session_id")) is None else ""
             if data.get("source") != "compact" and scope_of(data.get("session_id")) is None:
                 recent = "\n\n".join(x for x in (recent, held_notice(db)) if x)
-        elif data.get("source") != "compact":  # Codex (its SessionStart): what was saved here lately
-            recent = _recent_block(db, data.get("cwd"), client_env())
+        elif data.get("source") != "compact":  # Codex (its SessionStart), or any other: what it may see of the latest
+            recent = _recent_block(db, data.get("cwd"), who)
     text = None
     if probe is not None:
         probe.join(_whatsup().BUDGET + 0.3)
@@ -7888,25 +8047,22 @@ def held_notice(db, now=None):
             f"`{CFG.command} held` to see and confirm them.")
 
 
-def _start_block(db, folder, client, session_id):
+def _start_block(db, folder, who, session_id):
     """Claude Code's session-start block (instant.start_block): the project's standing lessons, then the last day's
     saves; "" when there is none, LESSONS_MODE is off, or it failed (a start is never held up by it)."""
     if LESSONS_MODE == "off" or not folder:
         return ""
     try:
-        who = client_from_request({"name": client[0], "key": client[1]}) if client[0] not in (None, "desk") \
-            else ("desk", True)
         return _instant().start_block(_self(), db, folder, who, session_id)
     except Exception as e:
         print(f"{SERVER_NAME}: no lessons block: {e}", file=sys.stderr)
         return ""
 
 
-def _recent_block(db, folder, client):
-    """The recent-saves block (instant.py) for a session starting in folder, as client ((name, key)) may see it; ""
+def _recent_block(db, folder, who):
+    """The recent-saves block (instant.py) for a session starting in folder, as who ((name, verified)) may see it; ""
     when there is none or it failed (a start is never held up by it)."""
     try:
-        who = client_from_request({"name": client[0], "key": client[1]})
         return _instant().recent_block(_self(), db, folder, who)
     except Exception as e:
         print(f"{SERVER_NAME}: no recent saves: {e}", file=sys.stderr)
@@ -7923,7 +8079,7 @@ def hook_cursor_start(data):
     if INSTANT_MODE == "on" and folder and DB_PATH.exists():
         db = connect()
         try:
-            text = _recent_block(db, folder, (client_env()[0] or "cursor", client_env()[1]))
+            text = _recent_block(db, folder, resolve_client(client_env()[0] or "cursor", client_env()[1]))
         finally:
             db.close()
     print(json.dumps({"additional_context": text} if text else {}))

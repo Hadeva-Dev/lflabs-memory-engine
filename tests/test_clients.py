@@ -144,6 +144,7 @@ class Policy(Case):
         self.assertEqual(mem.client_hide("someone", False), ("people",))
 
     def test_off_registers_nothing(self):
+        mem.RESTRICTED.pop("client:unknown", None)  # another test's unknown hook caller (with scopes on)
         self.assertIsNone(mem.client_scope("codex", False))
         self.assertEqual(mem.client_scope("codex", False, "telegram"), "telegram")
         self.assertNotIn("client:unknown", mem.RESTRICTED)
@@ -207,11 +208,17 @@ class Filtering(Case):
 class Hook(Case):
     """Another agent's prompt hook (Codex's UserPromptSubmit) names itself in its environment."""
 
-    def run_hook(self, env):
+    def run_hook(self, env, claude=True):
+        """claude: the payload Claude Code sends (its own transcript, its event name); else none to show it."""
         out = io.StringIO()
-        with mock.patch.dict(os.environ, env), redirect_stdout(out), mock.patch.object(mem, "connect", lambda: self.db):
+        projects = self.tmp / "projects"
+        payload = {"prompt": PROMPT, "session_id": "h1", "cwd": f"{H}/orchard"}
+        if claude:
+            payload.update(transcript_path=str(projects / "-orchard" / "h1.jsonl"), hook_event_name="UserPromptSubmit")
+        with mock.patch.dict(os.environ, env), redirect_stdout(out), mock.patch.object(mem, "connect", lambda: self.db), \
+                mock.patch.object(mem, "CLAUDE_PROJECTS", projects):
             self.db.execute("delete from injections")
-            mem.hook_prompt({"prompt": PROMPT, "session_id": "h1", "cwd": f"{H}/orchard"})
+            mem.hook_prompt(payload)
         return self.shown(out.getvalue())
 
     def test_keyed_restricted_and_claude_code_unchanged(self):
@@ -221,10 +228,104 @@ class Hook(Case):
         mem.clients_set("codex", deny=[])
         self.assertEqual(self.run_hook({mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: key}), ALL)
         self.assertEqual(self.run_hook({mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: "bad"}), RESTRICTED_VIEW)
-        self.assertEqual(self.run_hook({}), ALL)  # Claude Code: desk
+        self.assertEqual(self.run_hook({}), ALL)  # Claude Code: desk, on its own transcript
+        self.assertEqual(self.run_hook({}, claude=False), RESTRICTED_VIEW)  # no name and nothing to show: work only
 
     def test_off_ignores_the_environment(self):
         self.assertEqual(self.run_hook({mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: "bad"}), ALL)
+
+
+class HookEvidence(Case):
+    """v0.1.8-rc2 gate (and 0.1.6, 0.1.7): Codex's prompt hook with LFLABS_MEMORY_CLIENT taken out of its command was
+    read as Claude Code's and given a personal note. Who calls is read from what the app itself sends (hook_client):
+    Claude Code's whole memory only on Claude Code's own transcript; a name can only narrow that."""
+
+    def setUp(self):
+        super().setUp()
+        self.on()
+        self.projects, self.sessions = self.tmp / "projects", self.tmp / "codex-home" / "sessions"
+        for p in (mock.patch.object(mem, "CLAUDE_PROJECTS", self.projects),
+                  mock.patch.object(mem, "CODEX_SESSIONS", self.sessions)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def claude(self, sid="h1", event="UserPromptSubmit"):
+        return {"session_id": sid, "transcript_path": str(self.projects / "-orchard" / f"{sid}.jsonl"),
+                "hook_event_name": event, "permission_mode": "default", "cwd": f"{H}/orchard"}
+
+    def codex(self, sid="h1", event="UserPromptSubmit"):
+        return {"session_id": sid, "transcript_path": str(self.sessions / "2026" / "11" / "10" /
+                                                          f"rollout-2026-11-10T09-00-00-{sid}.jsonl"),
+                "hook_event_name": event, "permission_mode": "default", "cwd": f"{H}/orchard", "model": "gpt-5.5"}
+
+    def cursor(self, sid="h1", event="beforeSubmitPrompt"):
+        return {"conversation_id": sid, "generation_id": "g1", "hook_event_name": event, "session_id": sid,
+                "workspace_roots": [f"{H}/orchard"], "transcript_path": str(self.tmp / "cursor" / f"{sid}.jsonl")}
+
+    def prompt(self, payload, env=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}), redirect_stdout(out), \
+                mock.patch.object(mem, "connect", lambda: self.db):
+            self.db.execute("delete from injections")
+            mem.hook_prompt({**payload, "prompt": PROMPT})
+        return self.shown(out.getvalue())
+
+    def test_codex_without_a_name_is_codex(self):
+        self.assertEqual(self.prompt(self.codex()), RESTRICTED_VIEW)
+
+    def test_codex_claiming_claude_code_is_still_codex(self):
+        for name in ("desk", "claude-code"):
+            self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: name}), RESTRICTED_VIEW, name)
+
+    def test_codex_with_its_own_key_gets_what_it_was_given(self):
+        key = self.add("codex")
+        mem.clients_set("codex", deny=[])
+        env = {mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: key}
+        self.assertEqual(self.prompt(self.codex(), env), ALL)
+        self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: "desk", mem.CLIENT_KEY_ENV: key}), RESTRICTED_VIEW)
+
+    def test_claude_code_without_a_name_gets_everything(self):
+        self.assertEqual(self.prompt(self.claude()), ALL)
+        self.assertEqual(self.prompt(self.claude(), {mem.CLIENT_ENV: "desk"}), ALL)
+
+    def test_claude_code_with_its_folder_moved(self):
+        cfg = self.tmp / "claude-cfg"
+        payload = {**self.claude(), "transcript_path": str(cfg / "projects" / "-orchard" / "h1.jsonl")}
+        self.assertEqual(self.prompt(payload), RESTRICTED_VIEW)  # not where Claude Code keeps them
+        self.assertEqual(self.prompt(payload, {"CLAUDE_CONFIG_DIR": str(cfg)}), ALL)  # where it does
+
+    def test_claude_code_may_be_narrowed_by_a_name(self):
+        self.assertEqual(self.prompt(self.claude(), {mem.CLIENT_ENV: "cursor"}), RESTRICTED_VIEW)
+
+    def test_nothing_to_show_or_another_apps_shape_is_work_only(self):
+        self.assertEqual(self.prompt({"session_id": "h1", "cwd": f"{H}/orchard"}), RESTRICTED_VIEW)
+        self.assertEqual(self.prompt(self.cursor()), RESTRICTED_VIEW)
+        wrong = {**self.claude(), "transcript_path": str(self.projects / "-orchard" / "another.jsonl")}
+        self.assertEqual(self.prompt(wrong), RESTRICTED_VIEW)  # not this session's own transcript
+        elsewhere = {**self.claude(), "transcript_path": str(self.tmp / "-orchard" / "h1.jsonl")}
+        self.assertEqual(self.prompt(elsewhere), RESTRICTED_VIEW)
+
+    def test_the_payloads_tell_the_apps_apart(self):
+        self.assertEqual(mem.hook_app(self.claude()), "desk")
+        for ev in ("SessionStart", "Stop", "SessionEnd"):
+            self.assertEqual(mem.hook_app(self.claude(event=ev)), "desk", ev)
+        self.assertEqual(mem.hook_app(self.codex()), "codex")
+        self.assertIsNone(mem.hook_app(self.cursor()))
+        self.assertIsNone(mem.hook_app({**self.claude(), "hook_event_name": "beforeSubmitPrompt"}))
+        self.assertIsNone(mem.hook_app({}))
+
+    def test_a_session_start_without_claude_codes_transcript_gets_no_claude_code_block(self):
+        calls = []
+        with mock.patch.object(mem, "INSTANT_MODE", "on"), mock.patch.object(mem, "import_files", lambda db: {}), \
+                mock.patch.object(mem, "connect", lambda: self.db), \
+                mock.patch.object(mem, "_start_block", lambda *a: calls.append(("start", a[2])) or ""), \
+                mock.patch.object(mem, "_recent_block", lambda *a: calls.append(("recent", a[2])) or ""), \
+                redirect_stdout(io.StringIO()):
+            mem.hook_session_start({**self.codex(event="SessionStart"), "source": "startup"})
+            mem.hook_session_start({"session_id": "x", "cwd": f"{H}/orchard", "source": "startup"})
+            mem.hook_session_start({**self.claude(event="SessionStart"), "source": "startup"})
+        self.assertEqual(calls, [("recent", ("codex", False)), ("recent", ("unknown", False)),
+                                 ("start", ("desk", True))])
 
 
 class Off(Case):

@@ -39,8 +39,9 @@ not ported here), each off | shadow | on and acting only as far as CARDS_MODE do
   claims already shown, not memory's own lines, so it can repeat a fact a memory line already gave.
 Both read the same scope-filtered index and take each line through the same checks as any card line.
 
-Translation. A prompt with at least two common Portuguese, Spanish, French or German words, and more of them than
-common English ones (foreign()), is translated to English by one cheap-tier model call and searched with both texts. English
+Translation. A prompt written mostly in Chinese or Japanese (by Unicode range), in another script past Latin, or with
+at least two common Portuguese, Spanish, French or German words and more of them than common English ones (foreign()),
+is translated to English by one cheap-tier model call and searched with both texts. English
 prompts cost nothing. The daemon answers one hook at a time, so with TRANSLATE_MODE on the hook itself makes the call
 before it asks the daemon (mem.hook_prompt); in shadow the daemon's shadow worker makes it, cached for the daemon's
 life, and logs only what the second text would add.
@@ -666,10 +667,14 @@ _lock = threading.Lock()
 
 
 def foreign(prompt):
-    """Whether a prompt is not in English: at least two common Portuguese, Spanish, French or German words and more of
-    them than common English words. No model."""
-    if any(c.isalpha() and ord(c) > 0x24F for c in (prompt or "")):  # a script past Latin: Chinese, Japanese, Korean,
-        return True  # Cyrillic, Arabic, Hebrew, Greek, Thai... (clean-VM CJK test, 2026-11-09: never translated)
+    """Whether a prompt is not in English: written mostly in Han, Hiragana or Katakana (cjk.mostly, by Unicode range:
+    a word list never fires on unspaced text), any letter of another script past Latin, or at least two common
+    Portuguese, Spanish, French or German words and more of them than common English words. No model."""
+    from . import cjk
+    if cjk.mostly(prompt):  # an English question naming 王伟 is English: no call
+        return True
+    if any(c.isalpha() and ord(c) > 0x24F and not cjk.has(c) for c in (prompt or "")):  # Korean, Cyrillic, Arabic,
+        return True  # Hebrew, Greek, Thai... (clean-VM CJK test, 2026-11-09: never translated)
     ws = re.findall(r"[^\W\d_]+", (prompt or "").lower())
     if len(ws) < 3:
         return False
@@ -762,7 +767,7 @@ def extra(m, db, prompt, scope, session_id, kept, claimed, wants, which=("never_
     if not cs.ready(db) or cs.sweep_pending(db) or m.not_asked(prompt):
         return [], [], []
     prompt = m.STAMP_RE.sub("", prompt).strip()
-    if len(prompt.split()) < 3:
+    if m._cjk().words(prompt) < 3:
         return [], [], []
     seen = _seen(db, session_id)
     shown = _claim_ids(claimed)

@@ -30,9 +30,16 @@ class PromptHook(unittest.TestCase):
         for p in (mock.patch.object(mem, "SOCK", self.sock), mock.patch.object(mem, "DB_PATH", self.tmp / "memory.db"),
                   mock.patch.object(mem, "connect", lambda: None),
                   *(mock.patch.object(mem, k, "off") for k in ("NEVER_EMPTY_MODE", "CARDS_MODE", "TRANSLATE_MODE")),
-                  mock.patch.object(mem, "prompt_context", lambda db, prompt, sid, *ctx: self.local.append(prompt) or "local")):
+                  mock.patch.object(mem, "prompt_context", lambda db, prompt, sid, *ctx, **kw: self.local.append(prompt) or "local"),
+                  mock.patch.object(mem, "CLAUDE_PROJECTS", self.tmp / "projects")):
             p.start()
             self.addCleanup(p.stop)
+
+    def cc(self, sid):
+        """Claude Code's own transcript for this session (hook_client: only then is the hook Claude Code's)."""
+        path = self.tmp / "projects" / "-repo" / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def server(self, answer):
         """A daemon on the scratch socket: answer=None accepts and never replies (stuck or frozen)."""
@@ -54,7 +61,8 @@ class PromptHook(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         t = time.monotonic()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            mem.hook_prompt({"prompt": "what did we decide about backups", "session_id": "s1"})
+            mem.hook_prompt({"prompt": "what did we decide about backups", "session_id": "s1",
+                             "transcript_path": str(self.cc("s1")), "hook_event_name": "UserPromptSubmit"})
         return out.getvalue(), err.getvalue(), time.monotonic() - t
 
     def context(self, out):
@@ -62,22 +70,25 @@ class PromptHook(unittest.TestCase):
 
     def test_a_short_follow_up_sends_the_turn_before(self):
         from test_holdout import reply, user, write
-        path = write(self.tmp / "t.jsonl", [user("what did we decide about backups", 1.7e9),
+        path = write(self.cc("s1"), [user("what did we decide about backups", 1.7e9),
                                              reply("Nightly to the NAS at two. Want me to note it?", 1.7e9 + 60)])
         quiet = contextlib.redirect_stdout(io.StringIO())
         self.server("ok")
         with mock.patch.object(mem, "FOLLOWUP_MODE", "repo"), quiet:
-            mem.hook_prompt({"prompt": "yes do it", "session_id": "s1", "transcript_path": str(path)})
+            mem.hook_prompt({"prompt": "yes do it", "session_id": "s1", "transcript_path": str(path),
+                             "hook_event_name": "UserPromptSubmit"})
         self.assertEqual(self.requests[-1]["prev"]["user"], "what did we decide about backups")
         self.assertIn("NAS", self.requests[-1]["prev"]["reply"])
         self.server("ok")  # a full prompt: nothing read, nothing sent
         with mock.patch.object(mem, "FOLLOWUP_MODE", "repo"), quiet:
             mem.hook_prompt({"prompt": "what did we decide about the nightly backups to the NAS last week",
-                             "session_id": "s1", "transcript_path": str(path)})
+                             "session_id": "s1", "transcript_path": str(path),
+                             "hook_event_name": "UserPromptSubmit"})
         self.assertNotIn("prev", self.requests[-1])
         self.server("ok")  # off: nothing read
         with mock.patch.object(mem, "FOLLOWUP_MODE", "off"), quiet:
-            mem.hook_prompt({"prompt": "yes do it", "session_id": "s1", "transcript_path": str(path)})
+            mem.hook_prompt({"prompt": "yes do it", "session_id": "s1", "transcript_path": str(path),
+                             "hook_event_name": "UserPromptSubmit"})
         self.assertNotIn("prev", self.requests[-1])
 
     def test_daemon_answer_is_injected(self):

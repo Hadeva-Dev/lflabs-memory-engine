@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from lflabs_memory import access
+from lflabs_memory import brand, access
 from lflabs_memory import mem
 from test_redact import DBCase
 
@@ -395,6 +395,33 @@ class Keyless(Case):
         with redirect_stdout(io.StringIO()) as o2:
             mem._clients_cli(["add", "cursor", "--key"])
         self.assertIn(mem.CLIENT_KEY_ENV, o2.getvalue())
+
+    def test_the_products_cli_keys_codex_itself_so_level_says_neither_line(self):
+        """VM run, v0.1.8-rc2: `<command> access codex everything` printed the engine's key hint and "not connected
+        yet" before its own keying. With KEY_BY_ENV set to the command, `clients level` says neither and keys nothing."""
+        (Path(os.environ["HOME"]) / ".codex").mkdir(parents=True, exist_ok=True)  # Codex here, no entry of ours yet
+
+        def run(env):
+            with redirect_stdout(io.StringIO()) as o, mock.patch.dict(os.environ, env), \
+                    mock.patch.object(access, "human_at_terminal", lambda m, n, **k: None):
+                mem._clients_cli(["level", "codex", "everything"])
+            mem.clients_put("codex", access._mutation(mem, "level", level="work")[0], "test")  # back, for the next run
+            return o.getvalue()
+        plain = run({access.KEY_BY_ENV: ""})
+        self.assertIn("until its config carries a key", plain)
+        self.assertIn("not connected yet", plain)
+        by_cli = run({access.KEY_BY_ENV: brand.COMMAND})
+        self.assertIn("Codex sees everything", by_cli)
+        self.assertNotIn("until its config carries a key", by_cli)
+        self.assertNotIn("not connected", by_cli)
+
+    def test_the_variable_never_gets_an_agent_past_the_gate(self):
+        before = mem.client_hide("codex")
+        with redirect_stdout(io.StringIO()) as o, mock.patch.dict(os.environ, {access.KEY_BY_ENV: brand.COMMAND}), \
+                mock.patch.object(mem, "run_by_agent", lambda env=None: True), self.assertRaises(SystemExit):
+            mem._clients_cli(["level", "codex", "everything"])
+        self.assertIn("an AI app ran this", o.getvalue())
+        self.assertEqual(mem.client_hide("codex"), before)
 
     def test_cli(self):
         def run(*a):

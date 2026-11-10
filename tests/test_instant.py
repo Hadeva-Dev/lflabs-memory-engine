@@ -52,18 +52,25 @@ class Case(DBCase):
                   mock.patch.object(mem, "import_files", lambda db: {})):  # never the real ~/.claude
             p.start()
             self.addCleanup(p.stop)
+        self.ccprojects = self.tmp / "ccprojects"
+        p = mock.patch.object(mem, "CLAUDE_PROJECTS", self.ccprojects)
+        p.start()
+        self.addCleanup(p.stop)
         for k in ("LFLABS_MEMORY_CLIENT",):
             p = mock.patch.dict(os.environ)
             p.start()
             self.addCleanup(p.stop)
             os.environ.pop(k, None)
 
+    def cc(self, sid, event="UserPromptSubmit"):
+        """The payload fields Claude Code sends: its own transcript for the session, its event name (hook_client)."""
+        return {"transcript_path": str(self.ccprojects / "-orchard" / f"{sid}.jsonl"), "hook_event_name": event}
+
     def hook(self, prompt, cwd=None, sid="s1", typed=False):
         """typed: the turn then found in the transcript, as the Stop hook would (run_typed): the user's own words."""
         out = io.StringIO()
         with redirect_stdout(out):
-            mem.hook_prompt({"prompt": prompt, "session_id": sid, "cwd": str(cwd or self.repo),
-                             "transcript_path": str(self.tmp / "t.jsonl")})
+            mem.hook_prompt({"prompt": prompt, "session_id": sid, "cwd": str(cwd or self.repo), **self.cc(sid)})
         if typed:
             with self.db:
                 self.db.execute("update memories set origin = 'owner_typed' where coalesce(origin, 'unknown') ="
@@ -255,7 +262,7 @@ class Recent(Case):
         self.hook("remember that the staging DB is on port 6543", typed=True)
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"LFLABS_MEMORY_CLIENT": "codex"}), redirect_stdout(out):
-            mem.hook_session_start({"session_id": "c1", "cwd": str(self.repo), "source": "startup"})
+            mem.hook_session_start({**self.cc("c1", "SessionStart"), "session_id": "c1", "cwd": str(self.repo), "source": "startup"})
         ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertIn("the staging DB is on port 6543", ctx)
 
@@ -265,7 +272,7 @@ class Recent(Case):
     def claude_start(self, source="startup", sid="c1"):
         out = io.StringIO()
         with redirect_stdout(out):
-            mem.hook_session_start({"session_id": sid, "cwd": str(self.repo), "source": source})
+            mem.hook_session_start({**self.cc(sid, "SessionStart"), "session_id": sid, "cwd": str(self.repo), "source": source})
         text = out.getvalue().strip()
         return json.loads(text)["hookSpecificOutput"]["additionalContext"] if text else ""
 
@@ -290,7 +297,7 @@ class Recent(Case):
         git("init", "-q", cwd=other)
         out = io.StringIO()
         with redirect_stdout(out):
-            mem.hook_session_start({"session_id": "c3", "cwd": str(other), "source": "startup"})
+            mem.hook_session_start({**self.cc("c3", "SessionStart"), "session_id": "c3", "cwd": str(other), "source": "startup"})
         self.assertEqual(out.getvalue().strip(), "")  # another project: nothing
 
     def test_claude_code_start_caps_and_hides_like_recall(self):
@@ -352,7 +359,8 @@ class NeverUnasked(Case):
                     got.append(self.hook(q, sid=f"q-{client}-{i}"))
                 out = io.StringIO()
                 with redirect_stdout(out):
-                    mem.hook_session_start({"source": "startup", "cwd": str(self.repo), "session_id": f"st-{client}"})
+                    mem.hook_session_start({**self.cc(f"st-{client}", "SessionStart"), "source": "startup",
+                                             "cwd": str(self.repo), "session_id": f"st-{client}"})
                 got.append(out.getvalue())
         got.append(self.cursor_start([self.repo]))
         return got
@@ -413,7 +421,7 @@ class NeverUnasked(Case):
         def start(sid):
             out = io.StringIO()
             with redirect_stdout(out):
-                mem.hook_session_start({"source": "startup", "cwd": str(self.repo), "session_id": sid})
+                mem.hook_session_start({**self.cc(sid, "SessionStart"), "source": "startup", "cwd": str(self.repo), "session_id": sid})
             return out.getvalue()
         first = start("a")
         self.assertIn("2 notes your apps saved are waiting for you: run `", first)

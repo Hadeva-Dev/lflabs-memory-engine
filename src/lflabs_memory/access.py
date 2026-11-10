@@ -707,7 +707,9 @@ def undo(m, t=None, bare=False, typed=True, source="undo", session=None, now=Non
 
 # ---------- plain-language answers ----------
 
-def describe(m, name):
+def describe(m, name, key_hint=True):
+    """What this client sees, in one sentence. key_hint False: no word about its missing key (the product's CLI keys it
+    next: KEY_BY_ENV)."""
     hide = set(m.client_hide(name, True))
     who, level = name_of(name), level_name(hide, m)
     if not hide:
@@ -720,8 +722,8 @@ def describe(m, name):
         out = f"{who} sees everything except {labels(hide)}" + (" (nothing personal)" if level else "")
     else:
         out = f"{who} sees only {labels(universe(m) - hide)}"
-    if m.KEYLESS_MODE == "on" and _connect().needs_key(m, name) and not (m.client_policies().get(name) or {}).get(
-            "key_sha256"):
+    if key_hint and m.KEYLESS_MODE == "on" and _connect().needs_key(m, name) and not (
+            m.client_policies().get(name) or {}).get("key_sha256"):
         out += f"; until its config carries a key it gets work only (`{brand.COMMAND} access {name}` gives it one)"
     n = sum(r.get("target") == name for r in requests(m))
     return out + (f"; {n} request{'s' if n > 1 else ''} to widen it waiting for the user" if n else "")
@@ -1118,6 +1120,9 @@ def human_at_terminal(m, name, ask=input, level="more", dialog=None, ancestor=No
     return None
 
 
+KEY_BY_ENV = "LFLABS_MEMORY_KEY_BY"  # brand.COMMAND: the product's CLI keys the app after `clients level` (cli, level)
+
+
 def cli(m, args):
     cmd = args[0]
     if cmd == "level":
@@ -1128,8 +1133,12 @@ def cli(m, args):
                 why := human_at_terminal(m, args[1], level=LEVEL_LABEL.get(args[2], args[2]))):
             return why
         b, a = m.clients_put(args[1], change, "cli")
-        keys = _keys(m, [args[1]]) if set(m.policy_hide(b)) - set(m.policy_hide(a)) else []
-        return describe(m, args[1]) + "".join(f"\n{k}" for k in keys)
+        # The product's CLI (`<command> access`) writes the app's key itself right after this, into the entry it made:
+        # this neither keys it nor says it has no key. Only words and this keying are left out; the gate above ran
+        # all the same, so the variable gives an agent that sets it nothing (VM run, v0.1.8-rc2, 2026-11-10).
+        by_cli = os.environ.get(KEY_BY_ENV) == brand.COMMAND
+        keys = _keys(m, [args[1]]) if set(m.policy_hide(b)) - set(m.policy_hide(a)) and not by_cli else []
+        return describe(m, args[1], key_hint=not by_cli) + "".join(f"\n{k}" for k in keys)
     if cmd == "history":
         n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
         rows = history(m)[-n:]

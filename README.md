@@ -18,7 +18,7 @@ The installer, the `dawnmere` command, the Claude Code plugin and the connector 
 [Hadeva-Dev/dawnmere](https://github.com/Hadeva-Dev/dawnmere) (MIT). This repo is the engine's source, published so you
 can read and check what runs on your Mac: storage, search, the screening of saved text, and what each app may see.
 
-Version 0.1.5, early beta. This repo gets one commit per release.
+Version 0.1.6, early beta. This repo gets one commit per release.
 
 ## License
 

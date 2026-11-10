@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.6 (unreleased)
+
+Chinese and Japanese:
+
+- The prompt hook answers a question written in Chinese or Japanese. It was never searched: rules that count words by
+  spaces read an unspaced question as one word, "under three words". A CJK run now counts a word per two characters.
+- Keyword search reads Chinese and Japanese: a memory, a claim or a chat chunk with CJK in it also has the two-character
+  pieces of its CJK text in its own keyword table (chunk_cjk, claim_cjk, convo_cjk), used only for a query with CJK.
+  A store from an earlier version fills them once when it opens. Their rows go with the text, securely deleted.
+- The English reranker scores every Chinese or Japanese pair alike, so its score no longer decides for a CJK memory
+  and a CJK question: the memory reaches the prompt only when it shares enough of the question's words. A question
+  asked in other words than the memory's is often missed; a question that needs no memory gets none.
+- A prompt written mostly in Han, Hiragana or Katakana counts as not English (by Unicode range), so with a model set
+  up it is searched with its English translation too: one cheap-tier call per such prompt, inside the daily budget
+  (200), sent to your own backend. An English prompt that names someone in Chinese or Japanese costs no call.
+- First-person Chinese and Japanese notes about owing money, court dates, hospital stays and sleep are filed personal,
+  and so are notes that leave out the "I" but open with your own family (母が入院している, 妈妈住院了).
+- The remember tool's reply no longer says "every connected app can see it" for a health or money note filed under
+  projects: apps set to work only never see those, and the reply now says so.
+
 ## 0.1.5 (2026-11-10)
 
 - A first setup with existing Claude Code notes no longer fails to import them: the service's own first import and

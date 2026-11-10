@@ -265,6 +265,26 @@ class Translate(unittest.TestCase):
             self.assertTrue(facets_live.foreign(t), t)
         self.assertFalse(facets_live.foreign("can I approve this pull request?"))
 
+    def test_mostly_cjk_by_unicode_range(self):
+        # the word lists never fire on unspaced text; the share of Han, Hiragana and Katakana decides
+        for t in ("代码评审需要几个人通过？", "APIのタイムアウトは何秒？", "ステージングDBのポートは？", "我的dentist叫什么名字",
+                  "コミットメッセージは何語で書く？", "测试数据库用的是什么？"):
+            self.assertTrue(facets_live.foreign(t), t)
+        for t in ("where does 王伟 live?", "what did 田中 say about the deploy window on Friday?"):
+            self.assertFalse(facets_live.foreign(t), t)  # an English question naming someone: no model call
+
+    def test_a_cjk_prompt_is_searched_with_its_translation_too(self):
+        calls = []
+
+        def fake(prompt, schema, system, **kw):
+            calls.append(prompt)
+            return {"english": "How many approvals does a code review need?"}
+        with mock.patch.object(mem, "llm_json", fake):
+            got = facets_live.search_text(mem, None, "代码评审需要几个人通过？")
+            self.assertEqual(got, "How many approvals does a code review need?\n代码评审需要几个人通过？")
+            self.assertEqual(facets_live.search_text(mem, None, "where does 王伟 live?"), "where does 王伟 live?")
+        self.assertEqual(calls, ["代码评审需要几个人通过？"])  # one call, for the CJK prompt only
+
 
 if __name__ == "__main__":
     unittest.main()
