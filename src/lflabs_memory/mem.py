@@ -389,6 +389,7 @@ def connect():
     _erase_forgotten_once(db)
     _generic_names_once(db)
     _expire_forget_words(db)
+    prune_typed(db)
     try:
         purge_holds(db)
     except Exception as e:  # never stops the store opening; the next connect tries again
@@ -2587,6 +2588,13 @@ def snapshot(db, label):
         db.backup(dst)
         dst.execute("pragma journal_mode=delete")  # one self-contained file, no -wal beside it
         drop_meeting_rows(dst)
+        try:  # typed commands waiting for a transcript are of this moment only: never kept in a snapshot
+            with dst:
+                n = dst.execute("delete from typed_pending").rowcount
+            if n:
+                dst.execute("vacuum")  # their pages too
+        except sqlite3.OperationalError:  # none ever kept
+            pass
     finally:
         dst.close()
     os.chmod(path, 0o600)
@@ -2736,7 +2744,11 @@ def _merged_into(db, ids):
 
 def _erase(db, mid):
     """A memory's words gone from the store: the row stays with no text (a tombstone, as import_backup makes), out
-    of every index. Caller holds the transaction; connect() set secure_delete, so the old pages are overwritten."""
+    of every index, and any typed command still waiting with its words (_drop_typed). Caller holds the transaction;
+    connect() set secure_delete, so the old pages are overwritten."""
+    row = db.execute("select content, hash from memories where id = ?", (mid,)).fetchone()
+    if row is not None:
+        _drop_typed(db, mid, row["content"], row["hash"])
     db.execute("update memories set status = 'retired', content = '', hash = ?, merged_into = null where id = ?",
                (_hash(""), mid))
     _unindex(db, mid)
@@ -2807,6 +2819,8 @@ def scrub_backups(mem_ids, claim_ids=(), folder=None):
                     dst.execute(f"insert into {t}({t}, rank) values('secure-delete', 1)")
             gone = 0
             ids = list(mem_ids) + [m for m in _merged_into(dst, list(mem_ids)) if m not in mem_ids] if mem_ids else []
+            if "typed_pending" in tables:  # an older snapshot's waiting typed commands (snapshot() keeps none now)
+                gone += dst.execute("delete from typed_pending").rowcount
             if ids:
                 q = ",".join("?" * len(ids))
                 for t in ("injections", "claim_forgets"):
@@ -2991,6 +3005,42 @@ TYPED_PENDING = ("create table if not exists typed_pending(id integer primary ke
                  " transcript text, prompt text not null, speaker text not null, kind text not null, arg text,"
                  " at real not null)")
 TYPED_WAIT = 3600
+
+
+def _drop_typed(db, mid, content, h):
+    """Pending typed commands that hold a memory's words (its id, its hash, or its text in the typed prompt or the
+    kept fact): deleted when that memory's words are erased (rc review 2026-11-10: a Codex session's last "remember
+    that X" left X in typed_pending after X was forgotten). Caller holds the transaction."""
+    words = " ".join(clean_text(content or "").split())
+    try:
+        rows = db.execute("select id, prompt, arg from typed_pending").fetchall()
+    except sqlite3.OperationalError:  # none ever kept
+        return 0
+    gone = []
+    for r in rows:
+        try:
+            a = json.loads(r["arg"]) if (r["arg"] or "").startswith("{") else {}
+        except ValueError:
+            a = {}
+        ids = {str(a.get("id")), str(a.get("replace"))} | ({str(r["arg"])} if not a else set())
+        text = " ".join(clean_text(f"{r['prompt'] or ''} {a.get('fact') or ''}").split())
+        if str(mid) in ids or (h and a.get("hash") == h) or (words and words in text):
+            gone.append(r["id"])
+    if gone:
+        db.execute(f"delete from typed_pending where id in ({','.join('?' * len(gone))})", gone)
+    return len(gone)
+
+
+def prune_typed(db, now=None):
+    """Typed commands kept longer than TYPED_WAIT can no longer be made (run_typed drops them unmade): their words go
+    now, when the store opens and on the worker's pass, not only when that session's hooks run again (a Codex session
+    whose last prompt was "remember that ..." has no later hook). Returns how many went."""
+    try:
+        with db:
+            return db.execute("delete from typed_pending where at < ?",
+                              ((time.time() if now is None else now) - TYPED_WAIT,)).rowcount
+    except sqlite3.OperationalError:  # none ever kept, or a read-only store
+        return 0
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
@@ -7673,6 +7723,7 @@ def _worker():
         log(f"secret marking failed: {e}")
     while True:
         try:
+            prune_typed(db)
             _save_tick(db, log)
             last = db.execute("select value from meta where key = 'consolidated'").fetchone()
             if (not last or time.time() - float(last[0]) >= CONSOLIDATE_EVERY) and not vitals_paused():

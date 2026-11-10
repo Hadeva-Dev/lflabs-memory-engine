@@ -356,6 +356,24 @@ class NamesProveNothing(Case):
 
 
 class Widening(unittest.TestCase):
+    NEW_AGENTS = ("gemini", "qwen", "kimi", "qoder", "qodercli", "iflow", "cline", "trae", "codebuddy", "opencode")
+
+    def test_every_wired_apps_shell_is_an_agent(self):
+        """The apps setup now wires (and their kin) run commands under processes of these names: a widening that one
+        of them started is refused, as Claude Code's, Codex's and Cursor's are."""
+        import subprocess as sp
+        for agent in self.NEW_AGENTS:
+            chain = {500: "400 /bin/zsh\n", 400: f"300 /opt/homebrew/bin/{agent}\n", 300: "1 /sbin/launchd\n"}
+
+            def ps(argv, **kw):
+                return sp.CompletedProcess(argv, 0, chain[int(argv[-1])], "")
+            self.assertEqual(access.agent_ancestor(500, run=ps), agent)
+            with mock.patch.object(mem, "run_by_agent", lambda env=None: False):
+                why = access.human_at_terminal(mem, "cursor", ask=lambda q: "cursor",
+                                               ancestor=lambda: access.agent_ancestor(500, run=ps))
+            self.assertEqual(why, f"refused: this runs inside {agent}; widen access from a Terminal window that no "
+                                  "AI app started", agent)
+
     def test_a_command_an_app_runs_cannot_widen(self):
         with mock.patch.object(mem, "run_by_agent", lambda env=None: True):
             self.assertIn("an AI app ran this", access.human_at_terminal(mem, "cursor", ask=lambda q: "cursor"))

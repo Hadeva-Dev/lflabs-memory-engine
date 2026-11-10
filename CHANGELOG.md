@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7 (2026-11-10)
+
+- The engine's own model calls go only through your Claude plan, as the privacy text says. When Claude Code is pointed
+  at another provider (`ANTHROPIC_BASE_URL`, its token, model overrides, Bedrock or Vertex switches), the prompt hook's
+  translation of a non-English prompt no longer goes there: it fails closed and the prompt is searched as written.
+- A typed "remember that …" waiting to be confirmed no longer keeps its words in memory.db after its hour is up, or
+  after you forget the memory it made (backups included).
+- Widening an app's access is refused from inside Gemini CLI, Qwen Code, Kimi, Qoder, iFlow, Cline, Trae, CodeBuddy and
+  OpenCode too, as from Claude Code, Codex and Cursor.
+
 ## 0.1.6 (unreleased)
 
 Chinese and Japanese:

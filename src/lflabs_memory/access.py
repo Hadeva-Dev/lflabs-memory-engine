@@ -1041,7 +1041,8 @@ def tool_change(m, requester, client, change, what):
 
 # ---------- CLI ----------
 
-AGENT_PROCS = ("claude", "codex", "cursor", "cursor helper", "node", "windsurf", "copilot", "aider", "goose")
+AGENT_PROCS = ("claude", "codex", "cursor", "cursor helper", "node", "windsurf", "copilot", "aider", "goose",
+               "gemini", "qwen", "kimi", "qoder", "qodercli", "iflow", "cline", "trae", "codebuddy", "opencode")  # the apps setup wires, and their kin
 # The system's own tools, by absolute path and with a minimal environment: never whatever an agent put first on PATH
 # (review 2026-11-08: a fake osascript printing "button returned:Allow").
 PS, OSASCRIPT, SAFE_ENV = "/bin/ps", "/usr/bin/osascript", {"PATH": "/usr/bin:/bin"}

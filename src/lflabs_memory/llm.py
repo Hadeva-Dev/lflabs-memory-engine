@@ -88,9 +88,27 @@ def _version_tuple(v):
 QUIET_ENV = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1"}
 
 
+# What points Claude Code at another endpoint, provider or model: never passed to the engine's own `claude -p` runs, so
+# every model call goes where the privacy text says (the user's Claude plan through Claude Code). The prompt hook's
+# translation runs in the hook's own process, with the environment the user gave Claude Code: pointed at Kimi,
+# DeepSeek, GLM or Qwen (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN) it sent the prompt there (2026-11-10). Such a call
+# now fails (no Claude login: Unavailable) and the hook searches the prompt as it is. Only what Claude Code reads to
+# route: AWS_REGION, AWS_PROFILE and the like stay, since without its switches Claude Code does not use them.
+ROUTING_PREFIXES = ("ANTHROPIC_", "VERTEX_REGION_CLAUDE_")
+ROUTING_VARS = {"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+                "AWS_BEARER_TOKEN_BEDROCK", "CLOUD_ML_REGION"}
+
+
+def routed(name):
+    """Whether this variable sends Claude Code's requests somewhere else (ROUTING_PREFIXES, ROUTING_VARS)."""
+    return name.startswith(ROUTING_PREFIXES) or name in ROUTING_VARS
+
+
 def child_env(base=None):
-    """The environment of the engine's own claude -p runs."""
-    return {**(os.environ if base is None else base), CHILD_ENV: "1", **QUIET_ENV}
+    """The environment of the engine's own claude -p runs: the caller's, less what reroutes Claude Code (routed)."""
+    env = {k: v for k, v in (os.environ if base is None else base).items() if not routed(k)}
+    return {**env, CHILD_ENV: "1", **QUIET_ENV}
 
 
 class ClaudeCLI:
