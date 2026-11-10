@@ -1645,10 +1645,19 @@ def remember(db, content, kind="note", project=None, source=None, origin=None, v
             _tag(db, target["id"], content, kind, project, source)
             _log_save(db, target["id"], via, now, was_private, verified=verified)
             return target["id"], "updated"
-        mid = db.execute("insert into memories(content, kind, project, source, source_hash, hash,"
-                         " created, updated, origin, secret, writer) values (?,?,?,?,?,?,?,?,?,?,?)",
-                         (content, kind, project, source, h if source else None, h, now, now, origin, mark,
-                          writer)).lastrowid
+        try:
+            mid = db.execute("insert into memories(content, kind, project, source, source_hash, hash,"
+                             " created, updated, origin, secret, writer) values (?,?,?,?,?,?,?,?,?,?,?)",
+                             (content, kind, project, source, h if source else None, h, now, now, origin, mark,
+                              writer)).lastrowid
+        except sqlite3.IntegrityError:
+            # Another import of the same file got in between the look above and here (the embedding takes a moment):
+            # a first start's own import and setup's run together (VM run, 300 Claude Code notes, 5 of 5). That file
+            # is imported already; a later import brings any change.
+            got = db.execute("select id from memories where source = ?", (source,)).fetchone() if source else None
+            if got is None:
+                raise
+            return got[0], "unchanged"
         _index(db, mid, content, vec)
         _tag(db, mid, content, kind, project, source)
         _log_save(db, mid, via, now, verified=verified)
@@ -2044,7 +2053,7 @@ def held_list(db, count=False):
     if not rows:
         return "no app saves are held back"
     out = [f"{len(rows)} app save{'s are' if len(rows) > 1 else ' is'} kept out of prompts until you confirm "
-           "it (type the line in Claude Code or Codex):"]
+           f"{'them' if len(rows) > 1 else 'it'} (type the line in Claude Code or Codex):"]
     for r in rows:
         words = " ".join(r["content"].split())
         out.append(f"  #{r['id']} [{r['kind']}] {words[:100]}{'…' if len(words) > 100 else ''}\n"
@@ -3249,9 +3258,12 @@ def import_files(db):
             continue
         content, kind = _parse_md(path)
         if content:
-            _, action = remember(db, content, kind=kind,
-                                 project=_project_of_slug(path.parent.parent.name), source=str(path))
-            counts[action] += 1
+            try:
+                _, action = remember(db, content, kind=kind,
+                                     project=_project_of_slug(path.parent.parent.name), source=str(path))
+            except sqlite3.IntegrityError:  # one file another import is writing right now: never the whole import
+                action = "unchanged"
+            counts[action if action in counts else "unchanged"] += 1
     return counts
 
 

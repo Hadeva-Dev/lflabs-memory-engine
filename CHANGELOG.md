@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 (2026-11-10)
+
+- A first setup with existing Claude Code notes no longer fails to import them: the service's own first import and
+  setup's `import` can run at the same moment, and a note the other one has just written now counts as already
+  imported instead of failing the whole import (`UNIQUE constraint failed: memories.source`). A memory file that is
+  refused (one that looks like a key) no longer stops the import either.
+- `lflabs-memory held` says "them" for more than one waiting note.
+
 ## 0.1.4 (2026-11-08)
 
 Forgetting:
