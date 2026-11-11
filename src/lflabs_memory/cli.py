@@ -7,6 +7,7 @@ import sys
 import tomllib
 
 from . import config
+from .brand import COMMAND
 
 USAGE = """usage: lflabs-memory COMMAND [ARGS]
 
@@ -87,11 +88,17 @@ COMMANDS = {
         "holdout-report", "clients-report", "whats-up-report")},
     "adapt-reset": "adapt-reset: put the learning-from-use gate back to its prior",
 }
+# the commands the product CLI also runs (brand.COMMAND held, ...): their usage lines name that command
+FRONT = ("held", "trust", "forget", "restore", "search", "add")
 NEEDS_ARG = {"add": "TEXT", "search": "QUERY", "search-chats": "QUERY", "extract": "SESSION_ID"}
 
 
+def _prog(cmd):
+    return COMMAND if cmd in FRONT else "lflabs-memory"
+
+
 def _refuse(cmd, why):
-    print(f"lflabs-memory: {why}\n" + (f"usage: lflabs-memory {COMMANDS[cmd]}" if cmd else USAGE), file=sys.stderr)
+    print(f"{_prog(cmd)}: {why}\n" + (f"usage: {_prog(cmd)} {COMMANDS[cmd]}" if cmd else USAGE), file=sys.stderr)
     sys.exit(2)
 
 
@@ -104,7 +111,7 @@ def check(args):
     if cmd not in COMMANDS:
         _refuse(None, f"unknown command {cmd!r}\n")
     if any(a in ("-h", "--help") for a in args[1:]):
-        print(f"usage: lflabs-memory {COMMANDS[cmd]}")
+        print(f"usage: {_prog(cmd)} {COMMANDS[cmd]}")
         sys.exit(0)
     first = args[1] if len(args) > 1 else ""
     if cmd in NEEDS_ARG and (not first or first.startswith("-")):

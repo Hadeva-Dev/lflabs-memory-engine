@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from lflabs_memory import brand, access
-from lflabs_memory import mem
+from lflabs_memory import connect_apps, mem
 from test_redact import DBCase
 
 U = {*mem.SECTIONS, mem.WITHHELD, "chats"}
@@ -621,7 +621,7 @@ class KeyedIdentity(Case):
     def wire(self, client="cursor"):
         p = self.tmp / "home/.cursor/mcp.json"
         p.parent.mkdir(parents=True)
-        p.write_text(json.dumps({"mcpServers": {"lflabs-memory": access._connect().server_entry(mem, client,
+        p.write_text(json.dumps({"mcpServers": {connect_apps.SERVER: access._connect().server_entry(mem, client,
                                                                                                 "mcpServers")}}))
         return p
 
@@ -647,13 +647,13 @@ class KeyedIdentity(Case):
         cfg = self.wire()
         line = self.say("give Cursor everything")
         self.assertIn("Cursor got a new key in its config: restart Cursor to load it", line)
-        env = json.loads(cfg.read_text())["mcpServers"]["lflabs-memory"]["env"]
+        env = json.loads(cfg.read_text())["mcpServers"][connect_apps.SERVER]["env"]
         key = env[mem.CLIENT_KEY_ENV]
         self.assertNotIn(key, line + " ".join(self.notes))
         self.assertEqual(mem.resolve_client("cursor", key), ("cursor", True))
         self.assertEqual(mem.client_hide("cursor", True), ())
         self.say("let cursor see my contacts")  # already keyed: nothing rewritten
-        self.assertEqual(json.loads(cfg.read_text())["mcpServers"]["lflabs-memory"]["env"][mem.CLIENT_KEY_ENV], key)
+        self.assertEqual(json.loads(cfg.read_text())["mcpServers"][connect_apps.SERVER]["env"][mem.CLIENT_KEY_ENV], key)
 
     def test_a_widening_of_an_unwired_app_says_how(self):
         (self.tmp / "home/.cursor").mkdir(parents=True)
@@ -715,7 +715,7 @@ class RoundTwoSafety(Case):
     def test_a_widening_of_an_oddly_wired_app_says_it_stays_work_only(self):
         p = self.tmp / "home/.cursor/mcp.json"
         p.parent.mkdir(parents=True)
-        p.write_text(json.dumps({"mcpServers": {"lflabs-memory": {"command": "x", "args": ["y", "serve"]}}}))
+        p.write_text(json.dumps({"mcpServers": {connect_apps.SERVER: {"command": "x", "args": ["y", "serve"]}}}))
         self.assertIn("Cursor stays at work only until it has its key", self.say("let Cursor see my past chats"))
 
     def test_a_narrowing_that_became_a_widening_meanwhile_is_not_written(self):

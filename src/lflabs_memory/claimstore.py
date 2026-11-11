@@ -282,6 +282,64 @@ def forgotten_near(m, db, vec, said_at=None, own=False, skip=None):
     return None
 
 
+# Work words: only terms that say work on their own (security review 2026-11-10, second round: "team", "meeting",
+# "project", "review" and mem.CODE_RE's "class", "test" or "build" also name a dinner, a book club or a yoga class, and
+# filed them where every app sees them). A fact needs one of these to be filed under projects.
+WORK_RE = re.compile(
+    r"\b(?:deploy\w*|repos?|repositor(?:y|ies)|branch(?:es)?|commit(?:s|ted)?|pull requests?|prs?|merge requests?|"
+    r"ci|ci/cd|staging|prod|production|sprints?|standups?|stand-ups?|on-?call|database|endpoints?|schema|api|"
+    r"backend|frontend|codebase|monorepo|kubernetes|docker|npm|pnpm|lint\w*|jira|github|gitlab|"
+    r"build (?:cache|server|step|script|pipeline|fail\w*)|unit tests?|test suite)\b|`|\.(?:py|ts|js|json|toml)\b",
+    re.I)
+
+
+# Sensitive even when it is about work, and with no "my" needed: the user's job itself, their pay, their standing,
+# their relationships and family (security review 2026-11-10, both rounds: a fact names the user's family by name and
+# relation, "Robin's mom is in the hospital"). Personal, whatever work words come with it.
+SENSITIVE_RE = re.compile(
+    r"\b(?:interview\w*|job[- ](?:search\w*|hunt\w*|offer\w*|seek\w*)|offer letter|recruit\w*|head-?hunt\w*|"
+    r"resign\w*|quit\w* (?:my|the|his|her|their) job|leav\w* (?:my|the|his|her|their) job|laid off|lay-?offs?|"
+    r"fired|let go|severance|notice period|two weeks'? notice|salar\w*|pay (?:rise|raise|cut)|(?:a|my|his|her) raise|"
+    r"compensation|equity|stock options?|bonus\w*|promot\w*|demot\w*|performance (?:review|improvement|plan)|"
+    r"pip|h\.?r\.? (?:complaint|case|investigation|meeting)|complain\w* to h\.?r|harass\w*|bull(?:y|ied|ying)|"
+    r"discriminat\w*|disciplinar\w*|grievance|dating|girlfriend|boyfriend|partner|affair|break ?up|broke up|"
+    r"divorc\w*|crush|unemploy\w*|visa|immigration|"
+    r"mom|mum|mommy|mother|dad|daddy|father|parents?|wife|husband|spouse|fianc\w*|kids?|children|child|son|"
+    r"daughter|sister|brother|siblings?|grand(?:ma|pa|mother|father|parents?|son|daughter|kids?|children)|aunt|uncle|"
+    r"cousin|niece|nephew|in-laws?|family|separat\w*|wedding|married|marriage|engaged|engagement|pregnan\w*|baby|"
+    r"newborn|miscarr\w*|custody|funeral|passed away|hospital\w*)\b", re.I)
+
+
+def claim_section(m, fact):
+    """Where a claim from background reading is filed; personal unless shown to be work (fails closed). Any sign of
+    the user's own life (PERSONAL_RE: health, family, money, the law, relationships, read in the first person; the
+    health and money word list; SENSITIVE_RE: their job, pay, standing, relationships and family, on the fact as it
+    is) makes it personal. Only then does a work term (WORK_RE) file it under projects, where every app sees it
+    (signed-in run, 2026-11-10: "Managed's team deploys on Fridays and never on Mondays" was filed personal and never
+    reached Codex). Anything else stays personal: someone else's news is not work, and neither is a team dinner."""
+    said = first_person(m, fact)
+    # Personal and sensitive signals first, and alone: any of them keeps it personal, whatever work words it also has
+    # (security review 2026-11-10: "my therapist moved my session, so I'll miss Friday's deploy").
+    if m.PERSONAL_RE.search(said) or m.PERSONAL_CJK_RE.search(said) or SENSITIVE_RE.search(fact) or \
+            any(rx.search(fact) for rx in m.WITHHELD_RE):
+        return "personal"
+    return "projects" if WORK_RE.search(fact) else "personal"
+
+
+def first_person(m, fact):
+    """A claim as the user would say it, for filing it only: it names them in the third person ("Robin's sister",
+    "Robin Vale's mom", "Vale's divorce", "the user takes"), and PERSONAL_RE reads the first person ("my sister", "I
+    take"). owner_first_person first (the owner's full or first name, and their pronouns), then any part of their name
+    and "the user": reading another person's news as the owner's can only file it personal, the safe side here."""
+    out = owner_first_person(m, fact) if fact else fact
+    name = str(getattr(m, "OWNER_NAME", "") or "").strip()
+    names = {name, *re.findall(r"[^\W\d_]+", name), str(getattr(m, "OWNER", "") or "").strip(), "the user"} - {""}
+    for n in sorted(names, key=len, reverse=True):
+        out = re.sub(rf"\b{re.escape(n)}['\u2019]s\b", "my", out, flags=re.I)
+        out = re.sub(rf"\b{re.escape(n)}\b", "I", out, flags=re.I)
+    return out
+
+
 def add(m, db, content, origin, *, kind="user", section="personal", channel=None, sender=None, said_on=None,
         fact_at=0, source=None, session_id=None, said_at=None, vec=None, rewrite_of=None):
     """Store one claim. (id, "added" | "updated" | "unchanged"), or (None, why) when refused."""
@@ -1009,7 +1067,7 @@ def run_slice(m, db, job, log=print):
             drop(f"label: {why}")
             continue
         cid, action = add(m, db, prefix + fact, origin, said_on=day, fact_at=len(prefix), session_id=job["session_id"],
-                          said_at=said_at, **meta)
+                          said_at=said_at, section=claim_section(m, fact), **meta)
         if cid is None:
             drop(re.sub(r" (?:#|c)\d+", "", action)[:60])
             continue

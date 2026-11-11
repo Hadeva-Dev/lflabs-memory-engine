@@ -9,6 +9,7 @@ import _env  # noqa: F401  (first: the test data folder and user)
 import contextlib
 import io
 import json
+import re
 import tempfile
 import time
 import unittest
@@ -198,7 +199,7 @@ class NoRelabelLiftsAHold(Case):
                     mock.patch.dict(mem.os.environ, {"CLAUDECODE": "1"}), \
                     mock.patch.object(mem, "ask_sense", lambda ids: True), contextlib.redirect_stdout(buf):
                 mem.main()
-            self.assertIn("unchanged", buf.getvalue())
+            self.assertIn("Already in memory as #", buf.getvalue())
             self.assertEqual(self.row(mid)["origin"], "unknown", origin)
             self.nowhere(mid)
             with self.db:
@@ -277,7 +278,7 @@ class Labels(Case):
         with mock.patch.object(mem.sys, "argv", ["lflabs-memory", "add", *extra]), \
                 mock.patch.object(mem, "ask_sense", lambda ids: True), contextlib.redirect_stdout(buf):
             mem.main()
-        mid = int(buf.getvalue().strip().splitlines()[-1].strip("()").split(",")[0])
+        mid = int(re.search(r"#(\d+)", buf.getvalue().strip().splitlines()[-1]).group(1))
         return self.db.execute("select * from memories where id = ?", (mid,)).fetchone()
 
     def test_add_with_any_label_is_held(self):

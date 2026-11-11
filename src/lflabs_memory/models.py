@@ -17,7 +17,7 @@ from . import brand
 
 # Where a models release's assets are downloaded from (flat: <name>-<file>). The public repo that also serves the
 # wheels: the engine's own repo is private, so its releases are not reachable for a stranger.
-BASE = f"https://github.com/Hadeva-Dev/{brand.COMMAND}/releases/download"
+BASE = f"https://github.com/LF-Labs-Inc/{brand.COMMAND}/releases/download"
 FILES = {"embed": ("model_quantized.onnx", "tokenizer.json"),  # bge-small-en-v1.5, int8
          "rerank": ("model_quantized.onnx", "tokenizer.json"),  # ms-marco-MiniLM-L-6-v2, int8
          "sense": ("friday_sense.py", "model_quantized.onnx", "runtime_config.json", "thresholds.json",

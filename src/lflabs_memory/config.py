@@ -26,6 +26,11 @@ SOCKET_ENV = "LFLABS_MEMORY_SOCKET"  # the connector socket (connector.py; the n
 HOST_ENV = "LFLABS_MEMORY_HOST_DIR"  # a host assistant's folder, given to its profile (profiles.load)
 
 
+# Files in the data folder no backup may copy: per-install secrets. The engine's own snapshots copy memory.db only;
+# a host's backup script reads this list from `paths --json` ("never_back_up").
+NOT_BACKED_UP = ("source-key.secret", "holdout-salt")
+
+
 @dataclass(frozen=True)
 class Paths:
     data: Path            # DATA_DIR
@@ -55,6 +60,8 @@ class Paths:
     def adapt_state(self): return self.data / "adapt-state.json"
     @property
     def holdout_salt(self): return self.data / "holdout-salt"
+    @property
+    def source_secret(self): return self.data / "source-key.secret"  # never backed up (NOT_BACKED_UP)
     @property
     def people_tags(self): return self.data / "people-tags.log"
     @property
@@ -108,6 +115,13 @@ class Config:
     def command(self):
         """What the user types to run this engine, for messages: the launcher's script (lflabs-memory, or mem.py)."""
         return Path(self.launcher[1]).name or "lflabs-memory"
+
+    @property
+    def front(self):
+        """What the user types for the commands the product CLI also runs (held, trust, forget, restore, search, add),
+        for messages: the CLI's command when this is the console script, else the launcher's script (mem.py)."""
+        from .brand import COMMAND
+        return COMMAND if self.command == "lflabs-memory" else self.command
 
     def with_data(self, data):
         """This config with another data folder (a bench's or a test's): every data file follows it, models too (the

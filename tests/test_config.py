@@ -226,7 +226,7 @@ class ImportSafe(unittest.TestCase):
         env["HOME"] = str(home)
         code = "from lflabs_memory import connect_apps; print(connect_apps.SERVER)"
         out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(out.stdout.strip(), "lflabs-memory", out.stderr)
+        self.assertEqual(out.stdout.strip(), __import__("lflabs_memory.brand").brand.COMMAND, out.stderr)
         self.assertFalse((home / "Library").exists())
         out = subprocess.run([sys.executable, "-c", code], env={**env, "LFLABS_MEMORY_HOME": str(home / "data")},
                              capture_output=True, text=True, timeout=60)

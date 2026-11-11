@@ -43,7 +43,8 @@ from pathlib import Path
 from . import config
 
 SERVER = config.peek().profile.server_name  # our entry's name in every app's config (importing never makes DATA_DIR)
-BACKUP = SERVER.removesuffix("-memory") + "-backup"  # <file>.lflabs-backup-<time>
+OLD_SERVER = "lflabs-memory"  # SERVER before 0.1.8: an entry of ours under it counts as connected, and gets its key
+BACKUP = "lflabs-backup"  # <file>.lflabs-backup-<time> (the product CLI's uninstall clears these)
 LIB = "Library/Application Support"
 NEW_KEY = "<a new key, written with --yes>"  # what a dry run shows in place of a key
 # (label, client, folder that shows the app is installed, [(kind, file, key)])
@@ -198,33 +199,33 @@ def _with_key(cmd, newkey, m):
     return tok + " " + cmd
 
 
-def _toml_set_key(text, newkey, m):
-    """Our [mcp_servers.lflabs-memory] table with its env key set (an inline env table rebuilt with its other keys
-    kept, or an env line added). Raises Skip for a shape it does not edit."""
+def _toml_set_key(text, newkey, m, name=SERVER):
+    """Our [mcp_servers.NAME] table with its env key set (an inline env table rebuilt with its other keys kept, or an
+    env line added). Raises Skip for a shape it does not edit."""
     import tomllib
     by_hand = " (move its env into one inline line, or remove the table and rerun connect)"
     eol = _eol(text)
-    s = re.escape(SERVER)
+    s = re.escape(name)
     head = re.search(rf'(?m)^[ \t]*\[[ \t]*mcp_servers\.(?:{s}|"{s}")[ \t]*\][ \t]*\r?$', text)
     if not head:
-        raise Skip(f"its {SERVER} table is not a plain [mcp_servers.{SERVER}] header: left alone" + by_hand)
+        raise Skip(f"its {name} table is not a plain [mcp_servers.{name}] header: left alone" + by_hand)
     if re.search(rf'(?m)^[ \t]*\[[ \t]*mcp_servers\.(?:{s}|"{s}")\.env[ \t]*\]', text):
-        raise Skip(f"its {SERVER} env is a sub-table: left alone" + by_hand)
+        raise Skip(f"its {name} env is a sub-table: left alone" + by_hand)
     nxt = re.compile(r"(?m)^[ \t]*\[").search(text, head.end())
     end = nxt.start() if nxt else len(text)
     body = text[head.end():end]
     try:
-        env = (tomllib.loads(text).get("mcp_servers") or {}).get(SERVER, {}).get("env") or {}
+        env = (tomllib.loads(text).get("mcp_servers") or {}).get(name, {}).get("env") or {}
         if not isinstance(env, dict) or not all(isinstance(v, str) for v in env.values()):
-            raise Skip(f"its {SERVER} env is not a table of strings: left alone" + by_hand)
+            raise Skip(f"its {name} env is not a table of strings: left alone" + by_hand)
         env = {**env, m.CLIENT_KEY_ENV: newkey}
         line = "env = { " + ", ".join(f"{json.dumps(k) if not re.fullmatch(r'[A-Za-z0-9_-]+', k) else k} = "
                                       f"{json.dumps(v)}" for k, v in env.items()) + " }"
     except (TypeError, ValueError, tomllib.TOMLDecodeError):
-        raise Skip(f"its {SERVER} env has values I don't write: left alone" + by_hand)
+        raise Skip(f"its {name} env has values I don't write: left alone" + by_hand)
     if re.search(r"(?m)^[ \t]*env[ \t]*=", body):
         if re.search(r"(?m)^[ \t]*env[ \t]*=[ \t]*\{[^\n#]*\}[ \t]*\r?$", body) is None:
-            raise Skip(f"its {SERVER} env line spans lines or has a comment: left alone" + by_hand)
+            raise Skip(f"its {name} env line spans lines or has a comment: left alone" + by_hand)
         body = re.sub(r"(?m)^[ \t]*env[ \t]*=[^\n]*?(\r?)$", lambda mt: line + mt.group(1), body, count=1)
     else:  # the env line goes right after the table's last line, before any blank lines
         stripped = body.rstrip("\r\n")
@@ -300,23 +301,24 @@ def _plan_toml(m, client, text, newkey, force, script):
                 "snippet": block, "new": new, "old": text}
     have = ours.get("env").get(m.CLIENT_KEY_ENV) if isinstance(ours.get("env"), dict) else None
     if newkey and (force or have != newkey):
-        if servers.get(SERVER) is not ours:
+        name = next((k for k in (SERVER, OLD_SERVER) if servers.get(k) is ours), None)
+        if name is None:
             raise Skip(f"its memory table is not named {SERVER}: set the key by hand ({m.CFG.command} clients add NAME "
                        "--key)")
-        new = _toml_set_key(text, newkey, m)
-        _check_toml(new, newkey, m)
+        new = _toml_set_key(text, newkey, m, name)
+        _check_toml(new, newkey, m, name)
         return {"state": "key", "note": m.own("give its table a new key (the user gave it more than work only)"),
                 "snippet": f"env = {{ {m.CLIENT_KEY_ENV} = {json.dumps(newkey)} }}\n", "new": new, "old": text}
     return {"state": "done", "note": f"already has {SERVER}"}
 
 
-def _check_toml(new, newkey=None, m=None):
+def _check_toml(new, newkey=None, m=None, name=SERVER):
     import tomllib
     try:
         d = tomllib.loads(new)
     except tomllib.TOMLDecodeError:
         raise Skip("would not parse as TOML with the table added: left alone; add these lines by hand")
-    entry = (d.get("mcp_servers") or {}).get(SERVER)
+    entry = (d.get("mcp_servers") or {}).get(name)
     if not isinstance(entry, dict) or newkey and (entry.get("env") or {}).get(m.CLIENT_KEY_ENV) != newkey:
         raise Skip("would not hold the table as written: left alone; add these lines by hand")
 

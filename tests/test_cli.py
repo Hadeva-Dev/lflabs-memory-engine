@@ -13,7 +13,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from lflabs_memory import cli, config
+from lflabs_memory import brand, cli, config
 
 MEM = Path(config.__file__).resolve().parent / "mem.py"
 
@@ -53,7 +53,7 @@ class Help(unittest.TestCase):
         for cmd in ("add", "search", "forget", "restore", "outline", "clients", "connect", "serve", "paths"):
             out, data = run(cmd, "--help")
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertTrue(out.stdout.startswith(f"usage: lflabs-memory {cmd}"), out.stdout)
+            self.assertTrue(out.stdout.startswith(f"usage: {cli._prog(cmd)} {cmd}"), out.stdout)
             self.assertFalse(data.exists(), cmd)
 
     def test_unknown_command(self):
@@ -69,7 +69,7 @@ class Arguments(unittest.TestCase):
                      ["add", "--kind", "feedback", "text after the option"], ["search", "-k", "3", "query"]):
             out, data = run(*args)
             self.assertEqual(out.returncode, 2, args)
-            self.assertIn("usage: lflabs-memory", out.stderr)
+            self.assertRegex(out.stderr, r"usage: (lflabs-memory|" + brand.COMMAND + ") ")
             self.assertNotIn("Traceback", out.stderr)
             self.assertFalse(data.exists(), args)
 
@@ -91,6 +91,17 @@ class Arguments(unittest.TestCase):
             self.assertNotIn("Traceback", out.stderr)
 
 
+class AddSays(unittest.TestCase):
+    def test_add_prints_a_plain_line(self):
+        """Not a Python tuple, "(1, 'added')" (VM gate 0.1.10 rc1)."""
+        from lflabs_memory import mem
+        self.assertEqual(mem.add_said((1, "added")), "Saved as #1.")
+        self.assertEqual(mem.add_said((4, "unchanged")), "Already in memory as #4.")
+        self.assertEqual(mem.add_said((4, "updated")), "Updated #4.")
+        self.assertEqual(mem.add_said((None, "refused: it looks like a key, token or password")),
+                         "Not saved: it looks like a key, token or password.")
+
+
 class CommandName(unittest.TestCase):
     def test_messages_name_the_command_this_install_has(self):
         """A plain install's messages say `lflabs-memory connect`; a host's mem.py launcher keeps `mem.py connect`."""
@@ -98,6 +109,19 @@ class CommandName(unittest.TestCase):
         self.assertEqual(replace(cfg, launcher=(sys.executable, "/x/bin/lflabs-memory")).command, "lflabs-memory")
         self.assertEqual(replace(cfg, launcher=("/j/python", "/j/host/mem.py")).command, "mem.py")
         self.assertEqual(replace(cfg, launcher=("", "")).command, "lflabs-memory")
+
+    def test_the_cli_front_doors_are_named_as_the_user_types_them(self):
+        """held, trust, forget, restore, search and add also run as the product CLI's own commands: messages and
+        usage lines about them name that command on a plain install; a host's launcher keeps its own name."""
+        cfg = config.current()
+        self.assertEqual(replace(cfg, launcher=(sys.executable, "/x/bin/lflabs-memory")).front, brand.COMMAND)
+        self.assertEqual(replace(cfg, launcher=("/j/python", "/j/host/mem.py")).front, "mem.py")
+        for cmd in cli.FRONT:
+            self.assertIn(cmd, cli.COMMANDS)
+            self.assertEqual(cli._prog(cmd), brand.COMMAND)
+        self.assertEqual(cli._prog("connect"), "lflabs-memory")
+        out, _ = run("held", "--help")
+        self.assertTrue(out.stdout.startswith(f"usage: {brand.COMMAND} held"), out.stdout)
 
 
 if __name__ == "__main__":

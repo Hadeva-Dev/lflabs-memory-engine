@@ -4,13 +4,13 @@
     "embed": [
       {
         "file": "model_quantized.onnx",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/embed-model_quantized.onnx",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/embed-model_quantized.onnx",
         "size": 34014426,
         "sha256": "6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4"
       },
       {
         "file": "tokenizer.json",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/embed-tokenizer.json",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/embed-tokenizer.json",
         "size": 711396,
         "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
       }
@@ -18,13 +18,13 @@
     "rerank": [
       {
         "file": "model_quantized.onnx",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/rerank-model_quantized.onnx",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/rerank-model_quantized.onnx",
         "size": 23143499,
         "sha256": "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe"
       },
       {
         "file": "tokenizer.json",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/rerank-tokenizer.json",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/rerank-tokenizer.json",
         "size": 711396,
         "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
       }
@@ -32,31 +32,31 @@
     "sense": [
       {
         "file": "friday_sense.py",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/sense-friday_sense.py",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/sense-friday_sense.py",
         "size": 14658,
         "sha256": "f1cc9c3d7f2bf12f259b779321630e1e2973944321f0802b36cc1e06bfb06ba0"
       },
       {
         "file": "model_quantized.onnx",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/sense-model_quantized.onnx",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/sense-model_quantized.onnx",
         "size": 237907278,
         "sha256": "608f332f6cf6bdebbf5a319707de9d8de7db096a5761957472e5a32d3f9d948c"
       },
       {
         "file": "runtime_config.json",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/sense-runtime_config.json",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/sense-runtime_config.json",
         "size": 795,
         "sha256": "5727d3383acf955a965ffe81b689444cd1f9658585bec58ffe7feeb2dce93449"
       },
       {
         "file": "thresholds.json",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/sense-thresholds.json",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/sense-thresholds.json",
         "size": 3849,
         "sha256": "d09b861ea2059ddc2a75c7170ea323f17d56545010850b27297dfda703e3c465"
       },
       {
         "file": "tokenizer.json",
-        "url": "https://github.com/Hadeva-Dev/dawnmere/releases/download/models-2026-10-28/sense-tokenizer.json",
+        "url": "https://github.com/LF-Labs-Inc/dawnmere/releases/download/models-2026-10-28/sense-tokenizer.json",
         "size": 13718522,
         "sha256": "de4e937f878baf2be25494cde721b2dd875db3eb705eda8a7d1bf1a94faba764"
       }

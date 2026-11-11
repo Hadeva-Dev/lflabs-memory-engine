@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from lflabs_memory import connector, mem, models
+from lflabs_memory import connect_apps, connector, mem, models
 from test_redact import DBCase
 from _fakes import fake_rerank
 
@@ -406,13 +406,13 @@ class Cli(Case):
     def test_add_prints_a_snippet_with_its_key(self):
         out, code = self.run_cli("add", "codex")
         self.assertEqual(code, 0)
-        self.assertIn("[mcp_servers.lflabs-memory]", out)
+        self.assertIn(f"[mcp_servers.{connect_apps.SERVER}]", out)
         self.assertIn('"--client", "codex"', out)
         self.assertIn(mem.CLIENT_KEY_ENV, out)
         key = out.split(f'{mem.CLIENT_KEY_ENV} = "')[1].split('"')[0]
         self.assertEqual(mem.resolve_client("codex", key), ("codex", True))
         js = out.split("other JSON configs:\n")[1].split("\n\nOptional")[0]
-        self.assertEqual(json.loads(js)["mcpServers"]["lflabs-memory"]["env"][mem.CLIENT_KEY_ENV], key)
+        self.assertEqual(json.loads(js)["mcpServers"][connect_apps.SERVER]["env"][mem.CLIENT_KEY_ENV], key)
         self.assertIn(f"{mem.CLIENT_ENV}=codex {mem.CLIENT_KEY_ENV}={key} ", out)  # the prompt hook's command
 
     def test_list_and_set(self):

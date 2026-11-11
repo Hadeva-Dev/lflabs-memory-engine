@@ -8,6 +8,7 @@ a command needs the user at a Terminal; Claude Code sends no telemetry for the e
 """
 import _env  # noqa: F401  (first: the test data folder and user)
 import json
+import re
 import os
 import tempfile
 import time
@@ -910,7 +911,7 @@ class UsersOwnAtATerminal(Case):
                 mock.patch.object(mem.sys, "argv", ["lflabs-memory", "add", "We deploy the orchard app on Fridays"]), \
                 mock.patch.object(mem, "ask_sense", lambda ids: True), contextlib.redirect_stdout(buf):
             mem.main()
-        mid = int(buf.getvalue().strip().splitlines()[-1].strip("()").split(",")[0])
+        mid = int(re.search(r"#(\d+)", buf.getvalue().strip().splitlines()[-1]).group(1))
         origin = self.row(mid)["origin"]
         with self.db:
             self.db.execute("delete from memories")

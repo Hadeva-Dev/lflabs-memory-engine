@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 
+from .. import brand
 from .hooks import ProfileHooks
 
 GROUP = "lflabs_memory.profiles"
@@ -56,7 +57,8 @@ class Profile:
     owner: str | None = None                  # what text calls the user (None: config.toml's owner_name, else
                                               # "the user")
     own: Callable | None = None               # text written for the user -> for this owner (None: owner.they)
-    server_name: str = "lflabs-memory"        # the MCP server's name in every app's config
+    server_name: str = brand.COMMAND          # the MCP server's name in every app's config ("lflabs-memory" before
+                                              # 0.1.8: connect still knows an entry of ours under it)
     menu_app: str | None = None               # what the host's menu-bar app is called (None: brand.PRODUCT)
     label: str | None = None                  # how messages from memory start ("<label>: ..."), and what the recall
                                               # block calls memory (None: brand.PRODUCT)

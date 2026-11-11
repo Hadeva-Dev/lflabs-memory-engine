@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.8 (2026-11-10)
+
+- Forgetting a memory now also removes its words from the notes handed to the next session ("Where you left off"),
+  from the chat index when it is on, from AUDIT.md, and from the same in every backup copy. A note that kept a
+  forgotten fact in other words reached the next app's prompt before.
+- Claude Code's own memory file for something you typed is no longer a second copy: it is filed with your note,
+  forgetting either takes both, and a file holding a forgotten memory is never imported again. Your Claude Code
+  file itself is left alone. Only a file that says the same thing as the note, and little more, counts as its copy:
+  a file with other facts in it stays its own memory, and forgetting the note leaves it as it is. The comparison
+  reads the file's body, without its name, description and "stated by the user" line.
+- A forgotten memory's file name no longer stays behind: Claude Code names its files after the subject
+  (`build-cache-volume-kestrel.md`), and the forgotten row kept that path. It keeps only a keyed hash of it now (an
+  HMAC with a secret kept in the data folder, outside memory.db and every backup), which still stops the file from
+  being imported again; older stores, their snapshots and backup/memories.json are converted once. A store restored
+  without its secret gets a new one, and its older forgotten files are then no longer blocked from re-import.
+- `add` prints a plain line ("Saved as #1.", "Already in memory as #1.") instead of a Python tuple. A chat whose title
+  names what you forgot loses its title in the chat index.
+- Background reading files a fact about your team, project, tools or work where every app sees it; only facts about
+  your own life (health, family, money, the law, relationships) stay personal.
+- A scripted `claude -p` run is no longer asked to save a "remember that" with a tool it cannot use.
+- When an app's forget is purged a day later, or a session that sees only some of your notes forgets something, the
+  clean-up of derived notes keeps to what that app or session may see. A note it may not see is left as it is, and so
+  is the chat index, unless the forget comes from somewhere that sees everything. Two shared common words are no
+  longer enough to count as a mention.
+- A fact that mixes your private life with your work ("my therapist moved my session, so I'll miss Friday's deploy")
+  is filed personal. Facts about job interviews, leaving or being let go, pay and offers, reviews and performance
+  plans, HR complaints and relationships are filed personal too, and so is any fact about your family or partner,
+  named or not ("Robin's mom is in the hospital"). Only a clearly work-specific term (deploy, repo, branch, staging,
+  prod, sprint, pull request, CI, database, endpoint, schema and the like) files a fact under projects: "team",
+  "meeting" or "project" alone no longer does.
+- The MCP server's name in every app's config is now the product's command, `connect` writes that name, and an entry
+  of ours still under the old name `lflabs-memory` counts as connected (it gets its key there). Messages and usage
+  lines about `held`, `trust`, `forget`, `restore`, `search` and `add` name the product's command, which runs them too;
+  `lflabs-memory` keeps working. Backups keep their `.lflabs-backup-<time>` name.
+
 ## 0.1.7 (2026-11-10)
 
 - The engine's own model calls go only through your Claude plan, as the privacy text says. When Claude Code is pointed

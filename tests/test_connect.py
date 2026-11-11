@@ -21,6 +21,8 @@ from lflabs_memory import access
 from lflabs_memory import connect_apps
 from lflabs_memory import mem
 
+S = connect_apps.SERVER  # our entry's name
+
 # Split so the fixture doesn't trip a secret check on its own source.
 FAKE = "sk-" + "test-DO-NOT-PRINT-0123456789abcdef"
 LIB = "Library/Application Support"
@@ -94,9 +96,9 @@ class Connect(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.snapshot(), before)
         self.assertIn("dry run", out)
-        for want in ("Claude Code        connected", "~/.codex/config.toml: add [mcp_servers.lflabs-memory]",
-                     "~/.codex/hooks.json: add a UserPromptSubmit hook", '~/.cursor/mcp.json: add mcpServers."lflabs-memory"',
-                     '~/.gemini/settings.json: add mcpServers."lflabs-memory"', "Windsurf           not installed",
+        for want in ("Claude Code        connected", f"~/.codex/config.toml: add [mcp_servers.{S}]",
+                     "~/.codex/hooks.json: add a UserPromptSubmit hook", f'~/.cursor/mcp.json: add mcpServers."{S}"',
+                     f'~/.gemini/settings.json: add mcpServers."{S}"', "Windsurf           not installed",
                      '"cursor"', '"--client", "codex"', "LFLABS_MEMORY_CLIENT=codex"):
             self.assertIn(want, out)
         self.assertNotIn(FAKE, out)
@@ -109,7 +111,7 @@ class Connect(unittest.TestCase):
         toml = (self.home / ".codex/config.toml").read_text()
         self.assertTrue(toml.startswith(CODEX_TOML))  # appended, not rewritten
         data = tomllib.loads(toml)
-        self.assertEqual(data["mcp_servers"]["lflabs-memory"]["args"][1:], ["serve", "--client", "codex"])
+        self.assertEqual(data["mcp_servers"][S]["args"][1:], ["serve", "--client", "codex"])
         self.assertEqual(data["mcp_servers"]["notes"]["env"]["API_KEY"], FAKE)
         hooks = json.loads((self.home / ".codex/hooks.json").read_text())
         self.assertEqual(hooks["hooks"]["PreToolUse"], CODEX_HOOKS["hooks"]["PreToolUse"])
@@ -117,12 +119,12 @@ class Connect(unittest.TestCase):
         self.assertTrue(cmd.startswith("LFLABS_MEMORY_CLIENT=codex ") and cmd.endswith(" hook-prompt"))
         cursor = json.loads((self.home / ".cursor/mcp.json").read_text())
         self.assertEqual(cursor["mcpServers"]["posthog"], CURSOR["mcpServers"]["posthog"])
-        self.assertEqual(cursor["mcpServers"]["lflabs-memory"]["args"][1:], ["serve", "--client", "cursor"])
+        self.assertEqual(cursor["mcpServers"][S]["args"][1:], ["serve", "--client", "cursor"])
         self.assertIn('\n    "mcpServers"', (self.home / ".cursor/mcp.json").read_text())  # its 4-space indent kept
         self.assertEqual(stat.S_IMODE(os.stat(self.home / ".cursor/mcp.json").st_mode), 0o600)
         claude = json.loads((self.home / f"{LIB}/Claude/claude_desktop_config.json").read_text())
         self.assertEqual(claude["preferences"], CLAUDE["preferences"])
-        self.assertEqual(claude["mcpServers"]["lflabs-memory"]["args"][1:], ["serve"])  # known by its reported name
+        self.assertEqual(claude["mcpServers"][S]["args"][1:], ["serve"])  # known by its reported name
         gemini = json.loads((self.home / ".gemini/settings.json").read_text())
         self.assertEqual(list(gemini), ["mcpServers"])
         # a backup of every file that existed, byte for byte
@@ -144,7 +146,7 @@ class Connect(unittest.TestCase):
                                           "env": {mem.CLIENT_KEY_ENV: FAKE}}}}
         p = self.put(".cursor/mcp.json", json.dumps(mine))
         code, out = self.run_connect(apply=True, only="cursor")
-        self.assertIn("already has lflabs-memory", out)
+        self.assertIn(f"already has {S}", out)
         self.assertEqual(json.loads(p.read_text()), mine)
         self.assertNotIn(FAKE, out)
 
@@ -155,7 +157,7 @@ class Connect(unittest.TestCase):
         self.assertIn("the Claude app is running", out)
         self.assertIn("--only claude-desktop", out)
         self.assertEqual((self.home / f"{LIB}/Claude/claude_desktop_config.json").read_bytes(), before)
-        self.assertIn("lflabs-memory", (self.home / ".cursor/mcp.json").read_text())  # the others still done
+        self.assertIn(S, (self.home / ".cursor/mcp.json").read_text())  # the others still done
 
     def test_json_with_comments_is_never_rewritten(self):
         text = '{\n  // my servers\n  "servers": {}\n}\n'
@@ -171,7 +173,7 @@ class Connect(unittest.TestCase):
         self.put(f"{LIB}/Code/User/mcp.json", json.dumps({"servers": {"x": {"command": "y"}}}))
         self.run_connect(apply=True, only="copilot")
         d = json.loads((self.home / f"{LIB}/Code/User/mcp.json").read_text())
-        self.assertEqual(d["servers"]["lflabs-memory"]["type"], "stdio")
+        self.assertEqual(d["servers"][S]["type"], "stdio")
         self.assertEqual(d["servers"]["x"], {"command": "y"})
 
     def test_symlinked_config_is_written_through_the_link(self):
@@ -181,7 +183,7 @@ class Connect(unittest.TestCase):
         link.symlink_to(real)
         self.run_connect(apply=True, only="cursor")
         self.assertTrue(link.is_symlink())
-        self.assertIn("lflabs-memory", json.loads(real.read_text())["mcpServers"])
+        self.assertIn(S, json.loads(real.read_text())["mcpServers"])
         self.assertTrue(list((self.home / "dotfiles").glob("cursor-mcp.json.lflabs-backup-*")))
 
     def test_broken_toml_is_left_alone(self):
@@ -189,7 +191,7 @@ class Connect(unittest.TestCase):
         code, out = self.run_connect(apply=True, only="codex")
         self.assertEqual(code, 1)
         self.assertEqual(p.read_text(), "model = \n[broken")
-        self.assertIn("[mcp_servers.lflabs-memory]", out)
+        self.assertIn(f"[mcp_servers.{S}]", out)
 
     def test_a_failed_check_restores_the_file(self):
         p = self.home / ".codex/config.toml"
@@ -206,7 +208,7 @@ class Connect(unittest.TestCase):
         (self.home / ".gemini/settings.json").mkdir()
         code, out = self.run_connect(apply=True)
         self.assertIn("Claude app", out)  # the last app was still reached
-        self.assertIn('added mcpServers."lflabs-memory"', out)
+        self.assertIn(f'added mcpServers."{S}"', out)
         self.assertEqual(code, 1)  # the directory at Gemini's path is reported, not hidden
 
     def test_crlf_files_keep_their_line_endings(self):
@@ -217,7 +219,7 @@ class Connect(unittest.TestCase):
         self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
 
     def test_a_memory_memory_entry_for_another_checkout_is_stale(self):
-        other = {"mcpServers": {"lflabs-memory": {"command": "py", "args": ["/elsewhere/mem.py", "serve"]}}}
+        other = {"mcpServers": {S: {"command": "py", "args": ["/elsewhere/mem.py", "serve"]}}}
         p = self.put(".cursor/mcp.json", json.dumps(other))
         code, out = self.run_connect(apply=True, only="cursor")
         self.assertIn("runs another mem.py", out)
@@ -260,21 +262,21 @@ class Connect(unittest.TestCase):
         code, out = self.run_connect()
         self.assertIn("<a new key, written with --yes>", out)
         code, out = self.run_connect(apply=True)
-        key = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"]["lflabs-memory"]["env"][
+        key = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         self.assertNotIn(key, out)
         self.assertEqual(mem.resolve_client("cursor", key), ("cursor", True))
         self.assertNotIn("env", json.loads((self.home / ".gemini/settings.json").read_text())["mcpServers"][
-            "lflabs-memory"])  # work only: the name is enough
+            S])  # work only: the name is enough
         before = self.snapshot()
         self.run_connect(apply=True)  # the key is right: nothing rotates
         self.assertEqual(self.snapshot(), before)
         cfg = json.loads((self.home / ".cursor/mcp.json").read_text())
-        cfg["mcpServers"]["lflabs-memory"]["env"][mem.CLIENT_KEY_ENV] = "edited-by-hand"
+        cfg["mcpServers"][S]["env"][mem.CLIENT_KEY_ENV] = "edited-by-hand"
         self.put(".cursor/mcp.json", json.dumps(cfg))
         code, out = self.run_connect(apply=True, only="cursor")
         self.assertIn("gave its entry a new key", out)
-        new = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"]["lflabs-memory"]["env"][
+        new = json.loads((self.home / ".cursor/mcp.json").read_text())["mcpServers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         self.assertEqual(mem.resolve_client("cursor", new), ("cursor", True))
         self.assertEqual(mem.resolve_client("cursor", key), ("cursor", False))
@@ -283,7 +285,7 @@ class Connect(unittest.TestCase):
         mem.clients_set("codex", allow=[], deny=[])
         self.run_connect(apply=True, only="codex")
         import tomllib
-        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"]["lflabs-memory"]["env"][
+        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         cmd = json.loads((self.home / ".codex/hooks.json").read_text())["hooks"]["UserPromptSubmit"][0]["hooks"][0][
             "command"]
@@ -292,11 +294,26 @@ class Connect(unittest.TestCase):
         mem._write_clients({"codex": {"deny": []}})  # the hash lost: both files get a new key together
         mem._clients.update(key=None)
         self.run_connect(apply=True, only="codex")
-        key2 = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"]["lflabs-memory"]["env"][
+        key2 = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         self.assertNotEqual(key, key2)
         self.assertIn(key2, (self.home / ".codex/hooks.json").read_text())
 
+
+    def test_a_table_under_the_old_name_counts_and_gets_its_key(self):
+        """An entry of ours under the name before 0.1.8 (OLD_SERVER) is connected: no second table is added, and a key
+        goes into it under that name."""
+        import tomllib
+        mem.clients_set("codex", allow=[], deny=[])
+        old = connect_apps.OLD_SERVER
+        self.put(".codex/config.toml", CODEX_TOML + f'\n[mcp_servers.{old}]\ncommand = "py"\nargs = '
+                 f'[{json.dumps(str(self.root / "mem.py"))}, "serve", "--client", "codex"]\n')
+        self.run_connect(apply=True, only="codex")
+        servers = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"]
+        self.assertNotIn(S, servers)
+        key = servers[old]["env"][mem.CLIENT_KEY_ENV]
+        self.assertEqual(mem.resolve_client("codex", key), ("codex", True))
+        self.assertEqual(connect_apps.BACKUP, "lflabs-backup")
 
     def test_files_with_a_key_and_all_backups_are_private(self):
         mem.clients_set("cursor", allow=[], deny=[])
@@ -309,7 +326,7 @@ class Connect(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(b).st_mode) & 0o077, 0, b)
         os.chmod(p, 0o400 | 0o200)  # stricter than 0600 stays as it is
         cfg = json.loads(p.read_text())
-        cfg["mcpServers"]["lflabs-memory"]["env"][mem.CLIENT_KEY_ENV] = "stale"
+        cfg["mcpServers"][S]["env"][mem.CLIENT_KEY_ENV] = "stale"
         p.write_text(json.dumps(cfg))
         self.run_connect(apply=True, only="cursor")
         self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
@@ -323,7 +340,7 @@ class Connect(unittest.TestCase):
             self.put(".codex/hooks.json", "{ not json")  # an error path prints the hook lines to add by hand
             code, out2 = self.run_connect(apply=True, only="codex")
         import tomllib
-        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"]["lflabs-memory"]["env"][
+        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         self.assertNotIn(key, out + out2)
         self.assertIn("<a new key, written with --yes>", out2)
@@ -334,15 +351,15 @@ class Connect(unittest.TestCase):
     def test_a_working_key_is_never_rotated_away(self):
         mem.clients_set("codex", allow=[], deny=[])
         key, _ = mem.clients_add("codex", with_key=True)
-        cfg = self.put(".codex/config.toml", CODEX_TOML + f'\n[mcp_servers.lflabs-memory]\ncommand = "py"\nargs = '
+        cfg = self.put(".codex/config.toml", CODEX_TOML + f'\n[mcp_servers.{S}]\ncommand = "py"\nargs = '
                        f'[{json.dumps(str(self.root / "mem.py"))}, "serve", "--client", "codex"]\n\n'
-                       f'[mcp_servers.lflabs-memory.env]\n{mem.CLIENT_KEY_ENV} = "{key}"\n', 0o444)  # read-only
+                       f'[mcp_servers.{S}.env]\n{mem.CLIENT_KEY_ENV} = "{key}"\n', 0o444)  # read-only
         code, out = self.run_connect(apply=True, only="codex")
         self.assertEqual(mem.resolve_client("codex", key), ("codex", True))  # the table's key still works
         cmd = json.loads((self.home / ".codex/hooks.json").read_text())["hooks"]["UserPromptSubmit"][0]["hooks"][0][
             "command"]
         self.assertIn(key, cmd)  # the hook got the same key
-        self.assertIn("already has lflabs-memory", out)
+        self.assertIn(f"already has {S}", out)
         os.chmod(cfg, 0o644)
 
     def test_a_backup_that_fails_is_reported_not_raised(self):
@@ -360,7 +377,7 @@ class Connect(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("not written (PermissionError)", out)
         import tomllib
-        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"]["lflabs-memory"]["env"][
+        key = tomllib.loads((self.home / ".codex/config.toml").read_text())["mcp_servers"][S]["env"][
             mem.CLIENT_KEY_ENV]
         self.assertEqual(mem.resolve_client("codex", key), ("codex", True))  # what was written is registered
 
@@ -378,7 +395,7 @@ class Connect(unittest.TestCase):
 
     def test_odd_toml_env_is_refused_not_crashed(self):
         mem.clients_set("codex", allow=[], deny=[])
-        table = (f'\n[mcp_servers.lflabs-memory]\ncommand = "py"\nargs = [{json.dumps(str(self.root / "mem.py"))}, '
+        table = (f'\n[mcp_servers.{S}]\ncommand = "py"\nargs = [{json.dumps(str(self.root / "mem.py"))}, '
                  f'"serve"]\n')
         for env in ('env = "oops"\n', "env = { WHEN = 1979-05-27T07:32:00Z }\n"):
             p = self.put(".codex/config.toml", CODEX_TOML + table + env)
