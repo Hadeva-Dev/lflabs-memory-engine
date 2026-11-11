@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.9 (2026-11-11)
+
+- An app set to see nothing gets nothing in its prompts either. A Codex or Cursor that had once been allowed more
+  (so it has a key) and was later set to `nothing`, or had sections hidden from it, still got work notes from its
+  prompt hook, which never carries the key. A name asked without its key is still held to work only, and now also
+  never sees what you hid from that name. Seeing more than work only still takes the key.
+- A note with no sensitivity label yet is kept out of a work-only app's session-start block and out of `recall_full`,
+  your own typed notes included, as it already was in recall and in prompts. A typed health or money note that the
+  word lists miss could reach a work-only app's start block before it was labelled.
+- A note you type reaches work-only apps (Codex, Cursor) at once, with or without the background service: the save
+  makes the sensitivity label itself when the service does not answer, with the same local model. Before, the note
+  waited up to a minute, or for good with the service stopped. A correction saved when the reply finishes is
+  labelled too. A save with the service stopped takes about a second longer.
+- A Terminal or app whose locale is not UTF-8 (GB2312, Shift-JIS, Latin-1) no longer breaks recall and typed saves
+  in the prompt hook, and `held` and `search` no longer end in a traceback on a memory the locale cannot write.
+- `add` and `search` read every word before the first option: `add buy milk tomorrow` saved "buy", and
+  `search heron build` searched "heron". An unknown option, or one missing its value (`search x -k`), is refused
+  with the usage line and exit code 2, and nothing is saved.
+- `add` says when the note is held: a note added from a script, or without Allow in the dialog, is kept out of
+  prompts until you confirm it, and the line now says so and names `held`. Search and recall find it already.
+- `forget` and `restore` exit 1 when nothing was done (no such memory, nothing to restore), and `restore N` on a
+  memory that was never forgotten says so instead of "restored #N".
+- A no to importing Claude Code's notes is kept: with `claude_notes = false` under `[privacy]` in config.toml, the
+  service no longer reads `~/.claude/projects/*/memory` in by itself at its start, weekly, or when a Claude Code
+  session starts. The default is unchanged (they are read), and `import` still reads them when you run it.
+
 ## 0.1.8 (2026-11-10)
 
 - Forgetting a memory now also removes its words from the notes handed to the next session ("Where you left off"),

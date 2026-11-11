@@ -921,19 +921,22 @@ def _weight(row, sections):
     return 1.0 if row["section"] in sections else 0.5 if row["section2"] in sections else 0.0
 
 
-def _withheld(row):
+def _withheld(row, spare_own=False):
     """Whether a memory's words name health or money (WITHHELD_RE): its full text, else the chunk at hand. A row
-    with neither is withheld (fails closed)."""
+    with neither is withheld (fails closed). spare_own: the user's own words are read by the word list while they
+    have no label (_visible only: what a save or a forget may reach, never what an app is shown)."""
     keys = row.keys()
     if SENSE_MODE == "on":  # a labelled memory: its labels decide; not labelled yet: the word list
         mid = row["memory_id"] if "memory_id" in keys else row["id"] if "id" in keys else None
         flags = _sense_flags()
         if flags and mid in flags["labelled"]:
             return mid in flags["withheld"]
-        if flags is not None and mid is not None and (row["origin"] if "origin" in keys else None) not in OWNER_ORIGINS:
-            # a model labels memories here and has not read this one yet (a fresh save, for up to a minute): an app's
-            # save is withheld from work-only apps until it has (review 2026-11-08); the user's own words, filed by
-            # where they said them (personal_fact) and checked by the word list below, are not held up
+        if flags is not None and mid is not None and \
+                not (spare_own and (row["origin"] if "origin" in keys else None) in OWNER_ORIGINS):
+            # a model labels memories here and has not read this one yet (the save makes the label itself, so only
+            # when none could be made): withheld from work-only apps until it has (review 2026-11-08), the user's own
+            # typed words too, in a start block and recall_full as in recall and the prompt hook (0.1.9: a health
+            # note the word list misses reached a work-only app's start block while it had no label)
             return True
     text = row["content"] if "content" in keys else row["text"] if "text" in keys else None
     return text is None or any(p.search(text) for p in WITHHELD_RE)
@@ -1061,6 +1064,28 @@ def sense_now(db, ids):
 
 
 def ask_sense(ids, wait=3.0):
+    """Label a fresh save now, so no work-only app waits for the daemon's next pass (sense_tick, once a minute) to see
+    it: the daemon does it with its warm model (sense_now there); when it does not answer (stopped, or busy past wait),
+    this process does, with the same model loaded cold (a few seconds, on a path that already loads the embedder), on
+    a connection of its own. False when neither made a label (no model, or it failed): the save then stays from
+    work-only apps until one is made (_withheld), as before (2026-11-11: a note typed in Claude Code was not in
+    Codex for up to a minute, and never with the service stopped)."""
+    if SENSE_MODE == "off" or not ids:
+        return False
+    if _ask_sense_daemon(ids, wait):
+        return True
+    try:
+        db = connect()
+        try:
+            return sense_now(db, ids) > 0
+        finally:
+            db.close()
+    except Exception as e:  # never costs the save
+        print(f"{SERVER_NAME}: sense label not made now: {type(e).__name__}", file=sys.stderr)
+        return False
+
+
+def _ask_sense_daemon(ids, wait):
     """From a hook process: ask the daemon to label a fresh save now (sense_now); False if it did not answer."""
     import socket
     try:
@@ -1129,10 +1154,10 @@ def sense_report(db):
     return "\n".join(out)
 
 
-def _allowed(row, only=(), hide=()):
+def _allowed(row, only=(), hide=(), spare_own=False):
     if hide and (row["section"] is None or row["section"] in hide or row["section2"] in hide):
         return False  # a hidden section, or not yet filed: unknown is not shown where something is hidden
-    if WITHHELD in hide and _withheld(row):
+    if WITHHELD in hide and _withheld(row, spare_own):
         return False
     return not only or row["section"] in only or row["section2"] in only
 
@@ -1455,16 +1480,20 @@ def _policy_name(x):
 
 def client_hide(name, verified=True):
     """The sections (and pseudo-sections) a client never sees: its deny list, plus everything outside its allow list
-    when it has one. An unverified or unknown client gets the "unknown" policy (UNKNOWN_DENY unless the user set one). With
+    when it has one. An unverified or unknown client gets the "unknown" policy (UNKNOWN_DENY unless the user set one),
+    and what its claimed name's own policy hides as well. With
     KEYLESS_MODE on, a client with no policy of its own gets the "unknown" one too, and anything not proven by a key
     (an UNKEYED name, an unverified or unknown client) sees at most work only."""
     pol = client_policies()
     p = pol.get(name if verified else "unknown")
     if p is None and KEYLESS_MODE == "on":
         p = pol.get("unknown") or new_client_entry("unknown")
-    if p is None:
-        return tuple(sorted(UNKNOWN_DENY))
-    hide = set(policy_hide(p))
+    hide = set(UNKNOWN_DENY) if p is None else set(policy_hide(p))
+    if verified is False and name != "unknown" and name in pol:
+        # A name asked without its key (a keyed app's own prompt hook, which never carries the key): it is counted as
+        # unknown, and never sees more than the user gave that name either. After `access codex nothing` a keyed
+        # Codex's prompts still got work notes (VM run 2026-11-11). It cannot be used to see more: it only adds.
+        hide |= set(policy_hide(pol[name]))
     if KEYLESS_MODE == "on" and verified is not True:
         hide |= set(WORK_HIDE)
     return tuple(sorted(hide))
@@ -2694,7 +2723,7 @@ def _visible(db, ids, scope=None):
         return set(ids)
     rows = db.execute(f"select id, content, section, section2, origin from memories where id in"
                       f" ({','.join('?' * len(ids))})", list(ids))  # origin: _withheld spares the user's own words
-    return {r["id"] for r in rows if _allowed(r, (), hide)}
+    return {r["id"] for r in rows if _allowed(r, (), hide, spare_own=True)}  # here only: nothing is shown by this
 
 
 def _near_active(db, vec, lo, k=8, skip=(), scope=None):
@@ -3104,7 +3133,7 @@ def restore(db, mid):
     with db:
         # content '' is a backup tombstone (see import_backup): nothing to bring back
         ok = db.execute("update memories set status='active', merged_into=null where id = ? and content != ''"
-                        " and status != 'held'", (mid,)).rowcount > 0
+                        " and status not in ('held', 'active')", (mid,)).rowcount > 0
         if ok:
             db.execute("delete from forgot_vec where rowid = ?", (mid,))  # restored: no longer a forgotten thing
         if ok and not db.execute("select 1 from chunks where memory_id = ?", (mid,)).fetchone():
@@ -3295,6 +3324,8 @@ def _typed_apply(db, r):
                               via=a.get("via"), scope=scope, merge=False)
             if new is not None and a.get("root"):
                 _instant().record_root(db, new, a["root"])
+            if new is not None:
+                ask_sense([new])  # as the prompt hook's save is (instant.try_save)
             return f"{LABEL}: saved: {a['fact']} (#{new}): #{mid} was changed before this reply finished" if new else None
         return None
     if r["kind"] == "remember-text":
@@ -3303,6 +3334,8 @@ def _typed_apply(db, r):
                                scope=scope, merge=False, replace=a.get("replace"))
         if mid is not None and a.get("root"):
             _instant().record_root(db, mid, a["root"])
+        if mid is not None:
+            ask_sense([mid])  # labelled now, so a work-only app may see it at once (_withheld)
         return f"{LABEL}: {'saved' if mid else 'not saved'}: {a['fact']}" + (f" (#{mid})" if mid else f" ({action})")
     if r["kind"] == "confirm":
         mid, code = r["arg"].split()
@@ -3551,6 +3584,17 @@ def _project_of_slug(slug):
         return "scratch"                                                                       # per-chat folders
     home = str(Path.home()).replace("/", "-")
     return slug.removeprefix(home).strip("-") or "home"
+
+
+# Reading Claude Code's own memory files (~/.claude/projects/*/memory) in without being asked: config.toml's
+# privacy.claude_notes, on unless the user said no to setup's question. `import` itself always reads them.
+CLAUDE_NOTES_MODE = _switch("CLAUDE_NOTES_MODE", "on" if CFG.privacy.claude_notes else "off")
+
+
+def auto_import(db):
+    """import_files when a session starts and in the weekly job: never after the user said no to importing Claude
+    Code's notes (setup then said "not imported", and the service read them in anyway minutes later)."""
+    return import_files(db) if CLAUDE_NOTES_MODE == "on" else None
 
 
 def import_files(db):
@@ -6150,7 +6194,7 @@ def speech_terms(db, top=SPEECH_TOP):
     for row in db.execute(f"select id, content, secret, updated, origin from memories where status = 'active'"
                           f" and {writer} is null and (source is null or source not like 'meeting:%')"
                           f" and coalesce(section, '') not in ({', '.join(repr(x) for x in REVIEW_HIDE)})"):
-        if is_secret(row) or _withheld(row) or SAID_RE.match(row["content"] or "") or row["origin"] in MENU_OTHERS:
+        if is_secret(row) or _withheld(row, True) or SAID_RE.match(row["content"] or "") or row["origin"] in MENU_OTHERS:
             continue
         terms = set()
         for sentence in re.split(r"(?:[.!?:;]|\n)\s*", row["content"]):
@@ -7995,7 +8039,7 @@ def _worker():
             _save_tick(db, log)
             last = db.execute("select value from meta where key = 'consolidated'").fetchone()
             if (not last or time.time() - float(last[0]) >= CONSOLIDATE_EVERY) and not vitals_paused():
-                import_files(db)
+                auto_import(db)
                 audit(db, log, merged=consolidate(db, log))
         except Exception as e:
             log(f"background job failed: {e}")
@@ -8327,7 +8371,7 @@ def hook_session_start(data):
             if _claims_ready(db):
                 db.execute("delete from claim_injections where session_id = ?", (data.get("session_id"),))
         db.execute("delete from injections where at < ?", (time.time() - 30 * 86400,))
-    import_files(db)
+    auto_import(db)
     recent = ""
     who, _ = hook_client(data)  # Claude Code's block only on its own transcript (hook_client)
     if INSTANT_MODE == "on" and data.get("source") in ("startup", "clear", "compact"):
@@ -9113,14 +9157,15 @@ def main():
         limit = int(args[args.index("--limit") + 1]) if "--limit" in args else STATUS_NOTE_LIMIT
         merged = None
         if cmd == "tidy":  # the whole weekly job now (what the daemon runs), so it is not due again for a week
-            import_files(db)
+            auto_import(db)
             merged = consolidate(db)
         print(audit(db, dry="--dry-run" in args, limit=limit, merged=merged))
     elif cmd == "extract":
         for row in extract(db, args[1]):
             print(row)
     elif cmd == "add":
-        opts = dict(zip(args[2::2], args[3::2]))
+        from . import cli  # every word before the first option is the text (cli.check refused a bad option already)
+        text, opts = cli.words_and_options("add", args[1:])
         source = opts.get("--source")
         if source is not None and not MEETING_SOURCE_RE.fullmatch(source):  # file imports set their own sources
             print("not saved: --source takes meeting:<id>#<n>")
@@ -9133,7 +9178,7 @@ def main():
             print(own("not saved: no command can say a memory is the user's own words (--origin); "
                       f"`{CFG.front} trust ID` asks you in a dialog"))
             sys.exit(2)
-        got = remember(db, args[1], opts.get("--kind", "note"), opts.get("--project"), source, origin, via="cli")
+        got = remember(db, text, opts.get("--kind", "note"), opts.get("--project"), source, origin, via="cli")
         if got[0] is not None and got[1] != "unchanged" and (origin is not None or source):
             with db:  # a command anyone with a shell can run: whatever label it gives (--origin outside, a meeting's
                 # guest), it is held like an app's save until the user confirms it (rc4 gate review 2026-11-09)
@@ -9143,9 +9188,12 @@ def main():
             ask_sense([got[0]])  # labelled now by the daemon, so a work-only app may see it at once (_withheld)
             if origin is None and got[1] == "added" and sys.stdin.isatty() and sys.stdout.isatty() and \
                     not run_by_agent() and _access().agent_ancestor() is None:  # the user at a Terminal: theirs, if
-                words = " ".join(args[1].split())  # they say so in the dialog (nothing else here can tell)
+                words = " ".join(text.split())  # they say so in the dialog (nothing else here can tell)
                 trust_ids(db, [got[0]], dialog_text=f"Save as your own words: \u201c{_snippet(words, 120)}\u201d?")
-        print(add_said(got))
+        row = db.execute("select * from memories where id = ?", (got[0],)).fetchone() if got[0] is not None else None
+        held = row is not None and row["status"] == "active" and held_back(row)  # no Allow in the dialog, or no Terminal
+        print(add_said(got) + (own(f" It is kept out of prompts until you confirm it, like an app's save: `{CFG.front} "
+                                   "held` shows the line to type. Search and recall find it already.") if held else ""))
     elif cmd == "vouch":  # only asks: the host puts each before the user, and their key decides
         if not HOST.vouch:
             print("vouching needs a host assistant that can ask you; this install has none")
@@ -9166,9 +9214,11 @@ def main():
             print(e)
             sys.exit(2)
     elif cmd == "search":
-        k = int(args[args.index("-k") + 1]) if "-k" in args else 8
-        sec = clean_section(args[args.index("--section") + 1]) if "--section" in args else None
-        for h in search(db, args[1], k, only=(sec,) if sec else (), writers="--outside" in args):  # cloud AIs' too
+        from . import cli
+        query, opts = cli.words_and_options("search", args[1:])
+        k = int(opts.get("-k", 8))
+        sec = clean_section(opts["--section"]) if "--section" in opts else None
+        for h in search(db, query, k, only=(sec,) if sec else (), writers="--outside" in opts):  # cloud AIs' too
             print(f"#{h['id']:<4} {h['score']:6.2f} c{h['ord']} [{h['kind']}/{h['project']}] {h['section'] or '-'} {'[from outside] ' * bool(h.get('writer'))}"
                   f"{_excerpt(h)[:150]}")
     elif cmd == "index-chats":
@@ -9209,15 +9259,25 @@ def main():
     elif cmd == "forget":
         if run_by_agent() or _access().agent_ancestor() is not None:  # an AI app's shell (its env, or its process
             # tree, which clearing the env does not leave; unreadable counts as one): the app's forget, held a day
-            print(app_forget(db, args[1] if args[1][:1] in "cC" else int(args[1]), "a command an app ran")[1])
+            said = app_forget(db, args[1] if args[1][:1] in "cC" else int(args[1]), "a command an app ran")[1]
         else:  # the user, at a Terminal: deleted now, for good
-            print(forget_reply(db, args[1] if args[1][:1] in "cC" else int(args[1])))
+            said = forget_reply(db, args[1] if args[1][:1] in "cC" else int(args[1]))
+        print(said)
+        if said.startswith(("no active ", "not forgotten")):  # nothing was forgotten: a script, or `&&`, can tell
+            sys.exit(1)
     elif cmd == "restore" and args[1][:1] in "cC":
-        print(f"restored {args[1]}" if unhold(db, args[1]) else f"{args[1]} is not waiting to be deleted")
+        ok = unhold(db, args[1])
+        print(f"restored {args[1]}" if ok else f"{args[1]} is not waiting to be deleted")
+        sys.exit(0 if ok else 1)
     elif cmd == "restore":
-        print(f"restored #{args[1]}" if restore(db, int(args[1])) else
+        if db.execute("select 1 from memories where id = ? and status = 'active'", (int(args[1]),)).fetchone():
+            print(f"#{args[1]} was not forgotten: there is nothing to restore")
+            sys.exit(1)
+        ok = restore(db, int(args[1]))
+        print(f"restored #{args[1]}" if ok else
               f"#{args[1]} cannot be restored (a forgotten memory is deleted for good; only one the weekly tidy retired"
               " comes back)")
+        sys.exit(0 if ok else 1)
     elif cmd == "classify":
         print(f"filed {classify(db, args[args.index('--model') + 1] if '--model' in args else None)} memories")
     elif cmd == "sections":

@@ -258,6 +258,21 @@ class Recent(Case):
         self.assertTrue(all(len(json.loads(ln[2:ln.rindex(" (")])) <= 200 for ln in lines))
         self.assertFalse(any("number 0 " in ln for ln in lines))  # older than a day
 
+    def test_a_no_to_importing_claude_codes_notes_is_kept(self):
+        """Setup's "Import the notes Claude Code already keeps?" answered no (privacy.claude_notes false): a session's
+        start, and the weekly job, no longer read them in anyway. `import` itself still does."""
+        read = []
+        with mock.patch.object(mem, "import_files", lambda db: read.append(1) or {}):
+            with mock.patch.object(mem, "CLAUDE_NOTES_MODE", "off"):
+                mem.hook_session_start({**self.cc("n1", "SessionStart"), "session_id": "n1", "cwd": str(self.repo),
+                                        "source": "startup"})
+                self.assertIsNone(mem.auto_import(self.db))
+                self.assertEqual(read, [])
+            with mock.patch.object(mem, "CLAUDE_NOTES_MODE", "on"):
+                mem.hook_session_start({**self.cc("n2", "SessionStart"), "session_id": "n2", "cwd": str(self.repo),
+                                        "source": "startup"})
+                self.assertEqual(read, [1])
+
     def test_codex_session_start(self):
         self.hook("remember that the staging DB is on port 6543", typed=True)
         out = io.StringIO()

@@ -1001,15 +1001,24 @@ class EffectiveLevel(Case):
         self.assertIn("until it has a key", line)
 
 
-class OwnWordsNotHeldUp(unittest.TestCase):
-    def test_the_users_own_unlabelled_save_is_not_withheld(self):
+class OwnWordsHeldUpToo(unittest.TestCase):
+    def test_the_users_own_unlabelled_save_is_withheld_from_what_an_app_is_shown(self):
+        """0.1.9: the user's own words with no label were read by the word list alone, so a typed health note the
+        list misses reached a work-only app's start block. They wait for their label like an app's save; only what a
+        save or a forget may reach (_visible) still reads them by the word list."""
         row = {"id": 9, "origin": "owner_typed", "content": "We deploy on Fridays", "section": "projects",
                "section2": None}
         app = {**row, "origin": "unknown"}
         with mock.patch.object(mem, "SENSE_MODE", "on"), \
                 mock.patch.object(mem, "_sense_flags", lambda: {"labelled": set(), "withheld": set()}):
-            self.assertFalse(mem._withheld(row))
+            self.assertTrue(mem._withheld(row))
             self.assertTrue(mem._withheld(app))
+            self.assertFalse(mem._allowed(row, (), tuple(mem.WORK_HIDE)))
+            self.assertFalse(mem._withheld(row, spare_own=True))  # _visible's reading
+            self.assertTrue(mem._withheld(app, spare_own=True))
+        with mock.patch.object(mem, "SENSE_MODE", "on"), \
+                mock.patch.object(mem, "_sense_flags", lambda: {"labelled": {9}, "withheld": set()}):
+            self.assertFalse(mem._withheld(row))  # labelled: the label decides
 
 
 class RestateNearDuplicate(Case):

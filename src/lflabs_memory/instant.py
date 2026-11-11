@@ -185,7 +185,7 @@ def try_save(m, db, prompt, session_id, cwd, client, transcript_path=None, now=N
                                                              "project": project, "via": client or "desk",
                                                              "root": root}))  # the user's once the transcript
     # shows them, if the row still holds these words then (_typed_apply)
-    m.ask_sense([mid])  # labelled now by the daemon, before a work-only app could see it
+    m.ask_sense([mid])  # labelled now (the daemon, else this process), before a work-only app could see it
     return SaveResult(mid, fact)
 
 

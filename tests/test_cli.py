@@ -4,6 +4,7 @@ engine loads, so none of them opens, creates or writes a store; a missing model 
   .venv/bin/python -m unittest -q test_cli
 """
 import _env  # noqa: F401  (first: the test data folder and user)
+import json
 import os
 import re
 import subprocess
@@ -101,6 +102,20 @@ class AddSays(unittest.TestCase):
         self.assertEqual(mem.add_said((None, "refused: it looks like a key, token or password")),
                          "Not saved: it looks like a key, token or password.")
 
+    def test_add_says_when_the_note_is_held(self):
+        """A note added from a Terminal without Allow in the dialog (or from a script) is held like an app's save:
+        "Saved as #1." alone read as done, and the note then never reached a prompt (public 0.1.10 install check)."""
+        data = Path(tempfile.mkdtemp(prefix="cli")).resolve() / "data"
+        data.mkdir()
+        (data / "config.toml").write_text('version = 1\nprofile = "generic"\nowner_name = "Robin"\n')
+        out = subprocess.run([sys.executable, "-m", "lflabs_memory.cli", "add", "the heron build ships on Thursdays"],
+                             capture_output=True, text=True, env={**os.environ, config.HOME_ENV: str(data)}, timeout=180)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        said = out.stdout.strip()  # one line: the id first
+        self.assertTrue(said.startswith("Saved as #1. "), said)
+        self.assertIn("kept out of prompts until you confirm it", said)
+        self.assertIn(f"`{brand.COMMAND} held`", said)
+
 
 class CommandName(unittest.TestCase):
     def test_messages_name_the_command_this_install_has(self):
@@ -122,6 +137,114 @@ class CommandName(unittest.TestCase):
         self.assertEqual(cli._prog("connect"), "lflabs-memory")
         out, _ = run("held", "--help")
         self.assertTrue(out.stdout.startswith(f"usage: {brand.COMMAND} held"), out.stdout)
+
+
+LEGACY = "zh_CN.GB2312"  # a locale that is not UTF-8, as some Terminals in China, Japan and Europe are still set
+
+
+def _has_locale(name):
+    try:
+        return name in subprocess.run(["locale", "-a"], capture_output=True, text=True, timeout=10).stdout.split()
+    except OSError:
+        return False
+
+
+@unittest.skipUnless(_has_locale(LEGACY), f"this machine has no {LEGACY} locale")
+class LegacyLocale(unittest.TestCase):
+    """Under a locale that is not UTF-8, Python reads every file and stdin in that locale: a prompt in Japanese was
+    a decode error in the hook (no recall, and a typed "remember that" never saved), and `held` or `search` showing a
+    memory the locale cannot write was a traceback. The files and the apps' JSON are UTF-8 whatever the Terminal is."""
+
+    def run_in(self, data, *args, stdin=None):
+        env = {**os.environ, config.HOME_ENV: str(data), "LC_ALL": LEGACY, "LANG": LEGACY}
+        env.pop("PYTHONUTF8", None)
+        env.pop("PYTHONIOENCODING", None)
+        return subprocess.run([sys.executable, "-m", "lflabs_memory.cli", *args], env=env, capture_output=True,
+                              input=stdin, timeout=180)
+
+    def setUp(self):
+        self.data = Path(tempfile.mkdtemp(prefix="cli")).resolve() / "data"
+        self.data.mkdir()
+        (self.data / "config.toml").write_text('version = 1\nprofile = "generic"\nowner_name = "Robin"\n')
+
+    def test_the_prompt_hook_reads_utf8(self):
+        payload = json.dumps({"session_id": "s1", "cwd": str(self.data), "prompt": "ヘロンのビルドはいつ出荷しますか"},
+                             ensure_ascii=False).encode("utf-8")
+        out = self.run_in(self.data, "hook-prompt", stdin=payload)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn(b"codec", out.stderr)
+        self.assertNotIn(b"error", out.stderr)
+
+    def test_a_memory_the_locale_cannot_write_is_still_shown(self):
+        text = "ヘロンのビルドは毎週木曜日に出荷する"
+        out = self.run_in(self.data, "add", text)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for cmd in (["held"], ["search", "ヘロン"]):
+            out = self.run_in(self.data, *cmd)
+            self.assertEqual(out.returncode, 0, out.stderr.decode(errors="replace"))
+            self.assertNotIn(b"Traceback", out.stderr)
+            self.assertIn(text, out.stdout.decode("utf-8"))  # a pipe, not a Terminal: UTF-8, as the files are
+
+
+class Words(unittest.TestCase):
+    """`add buy milk tomorrow` saved "buy", and `search heron build` searched "heron": only the
+    first word was read, without a word said. Every word before the first option is the text."""
+
+    def run_in(self, data, *args):
+        return subprocess.run([sys.executable, "-m", "lflabs_memory.cli", *args], capture_output=True, text=True,
+                              env={**os.environ, config.HOME_ENV: str(data)}, timeout=180)
+
+    def test_add_and_search_take_every_word(self):
+        data = Path(tempfile.mkdtemp(prefix="cli")).resolve() / "data"
+        data.mkdir()
+        (data / "config.toml").write_text('version = 1\nprofile = "generic"\nowner_name = "Robin"\n')
+        out = self.run_in(data, "add", "the", "heron", "build", "ships", "every", "Thursday", "--kind", "project")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = self.run_in(data, "search", "heron", "build", "-k", "3")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("[project/", out.stdout)
+        self.assertIn("the heron build ships every Thursday", out.stdout)
+
+    def test_a_bad_option_is_refused_before_anything_is_saved(self):
+        for args, said in ((["search", "heron", "-k"], "-k needs a number"),
+                           (["search", "heron", "-k", "many"], "-k needs a number"),
+                           (["add", "a note", "--kind"], "--kind needs a value"),
+                           (["add", "never", "use", "--force", "here"], "unknown option --force"),
+                           (["search", "heron", "--sectoin", "work"], "unknown option --sectoin")):
+            out, data = run(*args)
+            self.assertEqual(out.returncode, 2, (args, out.stderr))
+            self.assertIn(said, out.stderr)
+            self.assertIn(f"usage: {brand.COMMAND} {args[0]}", out.stderr)
+            self.assertNotIn("Traceback", out.stderr)
+            self.assertFalse(data.exists(), args)
+
+
+class ExitCodes(unittest.TestCase):
+    """A forget or restore that did nothing exits 1 (a script, or `&&`, can tell), and restoring a memory that was
+    never forgotten no longer answers "restored"."""
+
+    def run_in(self, data, *args):
+        return subprocess.run([sys.executable, "-m", "lflabs_memory.cli", *args], capture_output=True, text=True,
+                              env={**os.environ, config.HOME_ENV: str(data)}, timeout=180)
+
+    def test_nothing_done_is_exit_1(self):
+        data = Path(tempfile.mkdtemp(prefix="cli")).resolve() / "data"
+        data.mkdir()
+        (data / "config.toml").write_text('version = 1\nprofile = "generic"\nowner_name = "Robin"\n')
+        out = self.run_in(data, "add", "the heron build ships every Thursday")
+        self.assertEqual((out.returncode, out.stdout.split(". ")[0]), (0, "Saved as #1"), out.stderr)  # and that it is held
+        for args, said in ((["forget", "999"], "no active memory #999"),
+                           (["forget", "c999"], "no active claim c999"),
+                           (["restore", "999"], "#999 cannot be restored"),
+                           (["restore", "c999"], "c999 is not waiting to be deleted"),
+                           (["restore", "1"], "#1 was not forgotten: there is nothing to restore")):
+            out = self.run_in(data, *args)
+            self.assertIn(said, out.stdout, args)
+            self.assertEqual(out.returncode, 1, (args, out.stdout, out.stderr))
+        out = self.run_in(data, "search", "heron build")  # and the memory is as it was
+        self.assertIn("the heron build ships every Thursday", out.stdout)
+        out = self.run_in(data, "forget", "1")  # the user's forget, or an app's (when the suite runs in an app's shell)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
 
 if __name__ == "__main__":

@@ -90,6 +90,7 @@ class LLMConfig:
 @dataclass(frozen=True)
 class Privacy:
     codex_sessions: bool = False
+    claude_notes: bool = True     # read Claude Code's own memory files in by itself (mem.auto_import); setup's question
     chat_index: bool = False
     holdout: bool = False
     new_clients: str = "work"

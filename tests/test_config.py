@@ -110,6 +110,10 @@ class Load(unittest.TestCase):
                          ("Sam", "none", 50, "haiku"))
         self.assertTrue(cfg.privacy.chat_index)
         self.assertFalse(cfg.privacy.codex_sessions)
+        self.assertTrue(cfg.privacy.claude_notes)  # on unless the user said no
+        (data / "config.toml").write_text('version = 1\nprofile = "generic"\nmodels = "~/m"\n'
+                                          '[privacy]\nclaude_notes = false\n')
+        self.assertFalse(config.load().privacy.claude_notes)
         self.assertEqual(cfg.paths.models, self.home / "m")
         os.environ[config.MODELS_ENV] = str(self.home / "shared")
         self.assertEqual(config.load().paths.models, self.home / "shared")  # the environment over the file

@@ -162,7 +162,10 @@ class Filtering(Case):
         self.assertEqual(self.shown(self.ctx(("codex", False))), RESTRICTED_VIEW)  # a bad key: the restricted default
         mem.clients_set("codex", deny=["projects"])
         self.assertEqual(self.shown(self.ctx(("codex", True))), ALL - {"projects"})
-        self.assertEqual(self.shown(self.ctx(("codex", False))), RESTRICTED_VIEW)  # its own policy needs its key
+        # without its key it is counted as unknown, and never sees what the user hid from its name either
+        self.assertEqual(self.shown(self.ctx(("codex", False))), RESTRICTED_VIEW - {"projects"})
+        mem.clients_set("codex", deny=[])
+        self.assertEqual(self.shown(self.ctx(("codex", False))), RESTRICTED_VIEW)  # seeing more needs its key
 
     def test_recall_recent_and_full_text(self):
         view = mem.client_scope("codex", True)
@@ -283,6 +286,19 @@ class HookEvidence(Case):
         env = {mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: key}
         self.assertEqual(self.prompt(self.codex(), env), ALL)
         self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: "desk", mem.CLIENT_KEY_ENV: key}), RESTRICTED_VIEW)
+
+    def test_a_keyed_codex_set_to_nothing_gets_nothing_from_its_hook(self):
+        """Codex's prompt hook never carries the key (a key never goes on a command line), so it is the name without
+        proof. Once Codex had a key, that meant the "unknown" policy, work only, whatever the user had set for Codex
+        itself: after `access codex nothing` its prompts still got work notes (VM run 2026-11-11). A name asked
+        without its key never gets more than the user gave that name."""
+        key = self.add("codex")
+        mem.clients_set("codex", deny=[*mem.SECTIONS, "chats"])  # nothing
+        self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: "codex"}), set())
+        self.assertEqual(self.prompt(self.codex()), set())
+        self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: "codex", mem.CLIENT_KEY_ENV: key}), set())
+        mem.clients_set("codex", deny=[])  # everything: the hook, without the key, is still held to work only
+        self.assertEqual(self.prompt(self.codex(), {mem.CLIENT_ENV: "codex"}), RESTRICTED_VIEW)
 
     def test_claude_code_without_a_name_gets_everything(self):
         self.assertEqual(self.prompt(self.claude()), ALL)
