@@ -105,6 +105,73 @@ class AppForget(Case):
         self.assertIn("This cannot be undone.", out)
         self.assertEqual(self.row(self.mid)["content"], "")
 
+    # A memory hidden after a forget the user asked for in conversation (mem.hold_swept): theirs to delete or keep.
+
+    def test_an_apps_shell_cannot_bring_back_what_the_users_forget_request_hid(self):
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        out = self._cli(["restore", str(self.mid)], {"CLAUDECODE": "1"})
+        self.assertIn("only you can bring it back", out)
+        self.assertEqual((self.row(self.mid)["status"], self.code), ("held", 1))  # nothing was done: exit 1
+        with mock.patch.object(access, "agent_ancestor", lambda *a, **k: None):  # the user, at a Terminal
+            self.assertIn(f"restored #{self.mid}", self._cli(["restore", str(self.mid)], {}))
+        self.assertEqual((self.row(self.mid)["status"], self.code), ("active", 0))
+
+    def test_the_users_own_forget_deletes_what_their_forget_request_hid(self):
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        with mock.patch.object(access, "agent_ancestor", lambda *a, **k: None):
+            out = self._cli(["forget", str(self.mid)], {})
+        self.assertIn(f"Deleted #{self.mid} for good", out)
+        self.assertIn("This cannot be undone.", out)
+        self.assertEqual((self.row(self.mid)["content"], self.code), ("", 0))
+        self.assertEqual(self.db.execute("select count(*) from forget_holds").fetchone()[0], 0)
+        self.assertFalse(mem.restore(self.db, self.mid))
+        self.assertEqual([r[0] for r in self.db.execute("select rowid from forgot_vec")], [self.mid])
+
+    def test_an_apps_shell_cannot_bring_back_an_older_version_merged_into_what_was_hidden(self):
+        """The weekly tidy keeps the older text of a merged memory (status merged, merged_into): restoring that id
+        would bring the forgotten words back and take them out of the purge's reach (review 2026-11-10)."""
+        old, _ = mem.remember(self.db, "The orchard vendor is Kestrel Supply, account 7741", "project", "orchard",
+                              origin="owner_typed")
+        with self.db:
+            self.db.execute("update memories set status = 'merged', merged_into = ? where id = ?", (self.mid, old))
+            self.db.execute("delete from chunks where memory_id = ?", (old,))
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        out = self._cli(["restore", str(old)], {"CLAUDECODE": "1"})
+        self.assertIn("only you can bring it back", out)
+        self.assertEqual((self.row(old)["status"], self.code), ("merged", 1))
+
+    def test_the_users_own_forget_of_what_was_hidden_also_deletes_its_exact_copies(self):
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        text = self.db.execute("select content from memories where id = ?", (self.mid,)).fetchone()[0]
+        copy, did = mem.remember(self.db, text, "project", "orchard", origin="unknown")  # saved again while hidden
+        self.assertEqual(did, "added")
+        with mock.patch.object(access, "agent_ancestor", lambda *a, **k: None):
+            out = self._cli(["forget", str(self.mid)], {})
+        self.assertIn(f"Deleted #{self.mid} and its copies #{copy} for good", out)
+        self.assertEqual((self.row(self.mid)["content"], self.row(copy)["content"]), ("", ""))
+
+    def test_the_users_forget_of_what_was_hidden_names_every_copy_it_deleted_even_after_a_reindex(self):
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        text = self.db.execute("select content from memories where id = ?", (self.mid,)).fetchone()[0]
+        one, _ = mem.remember(self.db, text, "project", "orchard", origin="unknown")
+        two, did = mem.remember(self.db, text + " ", "reference", "orchard", origin="unknown", merge=False)
+        mem.reindex(self.db)  # drops the hidden memory's stored vector
+        with mock.patch.object(access, "agent_ancestor", lambda *a, **k: None):
+            out = self._cli(["forget", str(self.mid)], {})
+        copies = [m for m in (one, two) if m and m != self.mid and self.row(m)["content"] == ""]
+        self.assertTrue(copies)
+        for m in copies:
+            self.assertIn(f"#{m}", out)
+        self.assertEqual({self.row(m)["content"] for m in (one, two) if m}, {""})
+
+    def test_an_apps_shell_asked_to_forget_what_was_hidden_says_who_can(self):
+        """The line on the user's screen gives `forget N`: run through the app's own shell it is the app's forget,
+        which may not touch the hold, and must say so instead of "no active memory"."""
+        self.assertEqual(mem.hold_swept(self.db, [self.mid], []), ([self.mid], []))
+        out = self._cli(["forget", str(self.mid)], {"CLAUDECODE": "1"})
+        self.assertIn("only you can delete it", out)
+        self.assertEqual((self.row(self.mid)["status"], self.code), ("held", 1))
+
     def _cli(self, argv, env):
         import contextlib
         import io
@@ -112,11 +179,12 @@ class AppForget(Case):
         clean = {k: v for k, v in os.environ.items() if k not in mem.AGENT_ENV}
         buf = io.StringIO()
         with mock.patch.dict(os.environ, {**clean, **env}, clear=True), contextlib.redirect_stdout(buf):
+            self.code = 0  # the command's exit code: a script, or `&&`, reads it
             try:
                 with mock.patch.object(mem.sys, "argv", ["lflabs-memory", *argv]):
                     mem.main()
-            except SystemExit:
-                pass
+            except SystemExit as e:
+                self.code = e.code if isinstance(e.code, int) else int(bool(e.code))
         return buf.getvalue()
 
 

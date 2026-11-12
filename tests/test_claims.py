@@ -79,14 +79,15 @@ class FakeLLM:
 
     def __call__(self, prompt, schema, system, model=None, **k):
         kind = ("extract" if system.startswith("You keep the fact store") else "topics" if "write search queries" in system
-                else "rewrite" if system.startswith("You rewrite") else "pick")
+                else "rewrite" if system.startswith("You rewrite") else "memories" if "longer notes" in system else "pick")
         self.calls.append((kind, prompt))
         a = self.answers.get(kind)
         if isinstance(a, Exception):
             raise a
         return a(prompt) if callable(a) else a or ({"claims": [], "forget": []} if kind == "extract" else
                                                      {"topics": []} if kind == "topics" else {"forget": [], "mixed": []}
-                                                     if kind == "pick" else {"kept": "", "removed": "", "sure": False})
+                                                     if kind == "pick" else {"forget": []} if kind == "memories"
+                                                     else {"kept": "", "removed": "", "sure": False})
 
 
 class Base(DBCase):
@@ -383,6 +384,424 @@ class Extraction(Base):
         kept = self.by_text("dentist")
         self.assertEqual(kept["content"], "Robin has a dentist appointment on Friday at 3 pm.")
         self.assertEqual(kept["origin"], "owner_typed")
+
+    # A forget asked for in the user's own words reached the claims only: the memory saying the same thing stayed and
+    # went on being injected (memory-bench 2026-11-09: 4 of 6 forget leaks were such memories). Likeness to a forgotten
+    # claim only shortlists a memory; one more model call says which of them hold what was asked to be forgotten
+    # (review 2026-11-10: likeness alone held "20 mg" for "10 mg", and a September appointment for a March one).
+
+    def ask_forget(self, what="Diego", pick=None, session="desk", confirm=("Diego",), **answers):
+        """A slice in which the user asks to forget `what`. pick: the claims call's answer (default: the claim naming
+        Diego). confirm: words; the memories call answers with every listed memory holding one of them."""
+        answers.setdefault("memories", lambda p: {"forget": [n for n, line in self.listed(p)
+                                                             if any(w in line for w in confirm)]})
+        return self.slice([f"please forget everything about {what}"], {"forget": [], "claims": []}, session=session,
+                          topics={"topics": [what]},
+                          pick=pick or (lambda p: {"forget": [self.num(p, "Diego")], "mixed": []}), **answers)
+
+    @staticmethod
+    def listed(prompt):
+        return [(int(m[1]), m[0]) for m in re.finditer(r"^(\d+)\. .*$", prompt, re.M)]
+
+    def memory(self, text):
+        return mem.remember(self.db, text, origin="owner_typed")[0]
+
+    def asked(self, llm, kind="memories"):
+        return [p for k, p in llm.calls if k == kind]
+
+    def test_a_forget_in_the_slice_holds_the_memory_the_model_confirms_restates_it(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        same = self.memory("Robin's landlord is Diego Alves.")
+        other = self.memory("Robin's bike is a blue Trek.")
+        llm = self.ask_forget()
+        self.assertEqual(self.row(same)["status"], "held")
+        self.assertEqual(self.row(other)["status"], "active")
+        self.assertNotIn("landlord", mem.prompt_context(self.db, "who is Robin's landlord Diego Alves", "later") or "")
+        shown = self.asked(llm)
+        self.assertEqual(len(shown), 1)
+        self.assertNotIn("Trek", shown[0])  # nothing like a forgotten claim: never even shown
+        self.assertIn("please forget everything about Diego", shown[0])  # the request decides, read as the user's
+
+    def test_a_like_memory_the_model_does_not_confirm_stays(self):
+        """Likeness is not sameness: forgetting an old dose must not take the memory holding the current one."""
+        self.claim("Robin takes 10 mg of lisinopril.")
+        old = self.memory("Robin takes 10 mg of lisinopril daily.")
+        new = self.memory("Robin takes 20 mg of lisinopril.")
+        llm = self.ask_forget("the 10 mg dose", pick=lambda p: {"forget": [self.num(p, "10 mg")], "mixed": []},
+                              confirm=("10 mg",))
+        self.assertIn("20 mg", self.asked(llm)[0])  # near enough to be asked about
+        self.assertEqual(self.row(old)["status"], "held")
+        self.assertEqual(self.row(new)["status"], "active")
+
+    def test_no_memory_like_a_forgotten_claim_means_no_extra_call(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        self.memory("Robin's bike is a blue Trek.")
+        llm = self.ask_forget()
+        self.assertEqual([k for k, _ in llm.calls], ["extract", "topics", "pick"])
+
+    def test_one_sentence_of_a_long_memory_is_enough_to_ask_about_it(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        long = self.memory("Robin moved to Porto in March. Robin's landlord is Diego Alves. The flat has two "
+                           "bedrooms and a balcony over the river.")
+        self.ask_forget()
+        self.assertEqual(self.row(long)["status"], "held")
+
+    def test_when_the_memories_call_fails_nothing_is_held_and_the_count_says_so(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []},
+                                                        memories=RuntimeError("no model"))):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, memories=True)
+        self.assertEqual(self.row(note)["status"], "active")
+        self.assertEqual(st["memories_unchecked"], [note])
+
+    def test_a_number_the_memories_call_was_not_shown_is_ignored(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        other = self.memory("Robin's bike is a blue Trek.")
+        self.ask_forget(memories={"forget": [0, 2, 7, -1, "1", True]})
+        self.assertEqual({self.row(note)["status"], self.row(other)["status"]}, {"active"})
+
+    def test_the_sweeps_counts_name_the_memories_it_held(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []}, memories={"forget": [1]})):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, memories=True)
+        self.assertEqual(st["memories"], [note])  # ids only, for the log: `restore ID` needs one
+        self.assertNotIn("memories_error", st)
+
+    def test_the_sweep_holds_no_more_memories_in_a_day_than_an_app_may_and_names_the_rest(self):
+        """The model calls read the whole conversation, and a page quoted in it could steer them to name far more
+        than the user asked (security review 2026-11-10): what one day of requests can hide is capped."""
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        looser = self.memory("Diego Alves is the landlord of Robin's flat.")
+        exact = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "APP_FORGETS_A_DAY", 1), \
+                mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []},
+                                                           memories={"forget": [1, 2]})):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, memories=True)
+            self.assertEqual((st["memories"], st["memories_left"]), ([exact], [looser]))  # the nearest first
+            self.assertEqual(self.row(looser)["status"], "active")
+            self.assertEqual(mem.hold_swept(self.db, [looser], []), ([], [looser]))  # the day's one is used
+
+    def test_an_app_cannot_take_the_name_the_sweeps_holds_are_counted_under(self):
+        self.assertIsNone(mem.CLIENT_RE.fullmatch(mem.SWEEP_HOLDS))
+
+    def test_a_memory_no_longer_active_when_the_hold_is_made_is_left_as_it_is(self):
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.assertTrue(mem.forget(self.db, note))  # the user forgot it by id while the model was answering
+        self.assertEqual(mem.hold_swept(self.db, [note], []), ([], []))
+        self.assertEqual(self.row(note)["status"], "retired")
+        self.assertFalse(mem.unhold(self.db, note))
+
+    def test_only_a_true_copy_of_a_forgotten_claim_leaves_a_fingerprint_when_held(self):
+        """A fingerprint in forgot_vec refuses later saves near it: for a memory with other facts it would refuse
+        those too (review 2026-11-10). The forgotten claim's own fingerprint guards the forgotten fact."""
+        self.claim("Diego Alves is Robin's landlord.")
+        copy = self.memory("Robin's landlord is Diego Alves.")
+        long = self.memory("Robin moved to Porto in March. Robin's landlord is Diego Alves. The flat has two "
+                           "bedrooms and a balcony over the river.")
+        self.ask_forget()
+        self.assertEqual({self.row(copy)["status"], self.row(long)["status"]}, {"held"})
+        self.assertEqual([r[0] for r in self.db.execute("select rowid from forgot_vec")], [copy])
+
+    def seen(self, now, session="s"):
+        """The line at a terminal start of `session` as its own transcript records it, then a typed turn of the
+        user's there, as the Stop hook finds them (sweep_seen): only that makes them told. Returns the line."""
+        line = mem.sweep_notice(self.db, session, now=now)
+        with self.shown(now), mock.patch.object(mem, "_typed_turns", lambda *a: [(now + 6, f"{session}:1", "thanks, noted")]):
+            mem.sweep_seen(self.db, session, "x.jsonl")
+        return line
+
+    def shown(self, at, ids=None):
+        """The session's transcript holding the line as a terminal start's, given at `at` (mem._sweep_lines)."""
+        ids = mem.swept(self.db) if ids is None else ids
+        return mock.patch.object(mem, "_sweep_lines", lambda *a: [(at, "SessionStart", "cli", ids)])
+
+    def test_what_the_sweep_hid_is_erased_thirty_days_after_the_user_was_first_told_and_never_before(self):
+        """It was found, not named: the clock starts only when the line naming it was on the screen of a session the
+        user then typed in, and runs long enough for them to see it many times (owner's decision 2026-11-10)."""
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin moved to Porto in March. Robin's landlord is Diego Alves. The flat has two "
+                           "bedrooms and a balcony over the river.")
+        self.ask_forget()
+        day, t0 = 86400, time.time()
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 365 * day), [])  # never told: never erased
+        told = t0 + 365 * day
+        self.assertIn("30 days", self.seen(told))
+        self.assertTrue(self.seen(told + 5 * day))  # said again: the clock is the first telling's
+        self.assertEqual(mem.purge_holds(self.db, now=told + 29 * day), [])
+        self.assertEqual(self.row(note)["status"], "held")
+        self.assertEqual(mem.purge_holds(self.db, now=told + 30 * day + 60), [note])
+        self.assertEqual(self.row(note)["content"], "")
+        self.assertEqual([r[0] for r in self.db.execute("select rowid from forgot_vec")], [note])  # not saved again
+        self.assertFalse(mem.restore(self.db, note))
+
+    def test_a_session_start_nobody_typed_in_tells_no_one(self):
+        """A hook call is only JSON on stdin (review 2026-11-10: a process sending one start a day took each day's
+        line and the memory went on day 30 with the user never shown it). The line alone starts no clock and uses up
+        no day: a typed turn of the user's in that same session's transcript does (sweep_seen, at the Stop hook)."""
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.ask_forget()
+        day, t0 = 86400, time.time()
+        for n in range(40):  # a start a day that nobody types in
+            self.assertTrue(mem.sweep_notice(self.db, f"rogue{n}", now=t0 + n * day))
+            with self.shown(t0 + n * day), mock.patch.object(mem, "_typed_turns", lambda *a: []):
+                mem.sweep_seen(self.db, f"rogue{n}", "x.jsonl")
+            self.assertTrue(mem.sweep_notice(self.db, "mine", now=t0 + n * day + 3600))  # the user's own start still shows it
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 41 * day), [])
+        self.assertEqual(self.row(note)["status"], "held")
+        with self.shown(t0), mock.patch.object(mem, "_typed_turns", lambda *a: [(t0 - 3600, "mine:0", "an older turn"),
+                                                                                (t0 + 2, "mine:1", "sent with the start")]):
+            mem.sweep_seen(self.db, "mine", "x.jsonl")  # a turn from before the line could be read: not a reading
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 80 * day), [])
+
+    def test_the_thirty_days_start_when_the_user_typed_not_when_the_line_was_shown(self):
+        """A session left open, or resumed weeks later: the telling is the turn that shows they were there."""
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.assertEqual(mem.hold_swept(self.db, [note], []), ([note], []))
+        day, t0 = 86400, time.time() + 5
+        self.assertTrue(mem.sweep_notice(self.db, "open", now=t0))
+        with self.shown(t0), mock.patch.object(mem, "_typed_turns", lambda *a: [(t0 + 31 * day, "open:1", "back after a month")]):
+            self.assertTrue(mem.sweep_seen(self.db, "open", "x.jsonl"))
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 31 * day + 60), [])
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 61 * day + 60), [note])
+
+    def test_the_days_allowance_goes_to_the_nearest_whatever_order_the_model_lists_them_in(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        looser = self.memory("Diego Alves is the landlord of Robin's flat.")
+        exact = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "APP_FORGETS_A_DAY", 1), \
+                mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []},
+                                                           memories={"forget": [2, 1]})):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, memories=True)
+        self.assertEqual((st["memories"], st["memories_left"]), ([exact], [looser]))
+
+    def test_a_restored_memory_hidden_again_gets_a_new_thirty_days(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.ask_forget()
+        day, t0 = 86400, time.time()
+        self.assertTrue(self.seen(t0))
+        self.assertTrue(mem.restore(self.db, note))
+        self.assertEqual(mem.hold_swept(self.db, [note], []), ([note], []))
+        self.assertTrue(self.seen(t0 + 20 * day))
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 31 * day), [])  # 11 days since it was told of again
+        self.assertEqual(mem.purge_holds(self.db, now=t0 + 51 * day), [note])
+
+    def test_the_line_about_what_the_sweep_hid_names_ids_and_both_commands_at_every_start_while_one_waits(self):
+        """Nothing a hook or a transcript can do silences it (review 2026-11-10: whatever marks a day's line as said
+        can be forged by a process writing as the user, and a silenced line ends in an unseen deletion)."""
+        self.assertEqual(mem.sweep_notice(self.db, "s"), "")  # nothing hidden: nothing said
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.ask_forget()
+        now = time.mktime(time.localtime(time.time() + 86400)[:3] + (12, 0, 0, 0, 0, -1))  # noon tomorrow: the line
+        # prints a date, and the few minutes this test adds crossed midnight when it ran at 23:59; after the hold at
+        # every hour, so the user is told and the line is checked to be said still (review round 10)
+        line = mem.sweep_notice(self.db, "a", now=now)
+        for part in (f"#{note}", f" forget {note}`", f" restore {note}`"):
+            self.assertIn(part, line)
+        self.assertNotIn("Diego", line)  # ids, never the words
+        self.assertEqual(self.seen(now + 120, "c"), line)
+        self.assertEqual(mem.sweep_notice(self.db, "d", now=now + 180), line)  # seen today, and still said
+        self.assertTrue(mem.restore(self.db, note))
+        self.assertEqual(mem.sweep_notice(self.db, "f", now=now + 3 * 86400), "")
+
+    def test_a_line_shown_before_a_memory_was_hidden_again_does_not_tell_of_the_new_hold(self):
+        """A session shown the line, the memory restored and hidden anew, then a turn typed in that old session: the
+        new hold was never on that screen as it now stands (review 2026-11-10: its 30 days would have begun early)."""
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.assertEqual(mem.hold_swept(self.db, [note], []), ([note], []))
+        shown = time.time() + 5
+        self.assertTrue(mem.sweep_notice(self.db, "old", now=shown))
+        self.assertTrue(mem.restore(self.db, note))
+        with mock.patch.object(mem.time, "time", lambda: shown + 3600):
+            self.assertEqual(mem.hold_swept(self.db, [note], []), ([note], []))
+        with self.shown(shown, [note]), mock.patch.object(mem, "_typed_turns", lambda *a: [(shown + 7200, "old:1", "back again")]):
+            mem.sweep_seen(self.db, "old", "x.jsonl")
+        self.assertEqual(mem._sweep_told(self.db), {})
+        with self.shown(shown + 3601, [note]), mock.patch.object(mem, "_typed_turns", lambda *a: [(shown + 7200, "old:1", "back again")]):
+            mem.sweep_seen(self.db, "old", "x.jsonl")  # the control: a line given after the new hold does tell
+        self.assertEqual(list(mem._sweep_told(self.db)), [note])
+
+    def test_a_hold_whose_memory_came_back_another_way_is_no_longer_a_hold(self):
+        """A memory imported from a file is active again when its file changes (as after a forget by id): the line
+        must not go on calling it hidden, nor its row count against the day."""
+        note = mem.remember(self.db, "Robin's landlord is Diego Alves.", origin="owner_typed", source="notes/home.md")[0]
+        self.assertEqual(mem.hold_swept(self.db, [note], []), ([note], []))
+        mem.remember(self.db, "Robin's landlord is Diego Alves. Rent is due on the first.", origin="owner_typed",
+                     source="notes/home.md")
+        self.assertEqual(self.row(note)["status"], "active")
+        self.assertEqual(mem.swept(self.db), [])
+        self.assertEqual(mem.sweep_notice(self.db, "s"), "")
+
+    def test_the_fingerprint_at_the_erase_does_not_need_the_stored_vector(self):
+        """reindex drops the vector of every memory that is not active: the fingerprint is then made from the text."""
+        note = self.memory("Robin's landlord is Diego Alves.")
+        mem.hold_swept(self.db, [note], [])
+        mem.reindex(self.db)
+        self.assertEqual(mem.purge_holds(self.db, swept=note), [note])
+        self.assertEqual([r[0] for r in self.db.execute("select rowid from forgot_vec")], [note])
+
+    def test_older_holds_and_the_daily_line_do_not_use_up_todays_allowance(self):
+        old, new = self.memory("Robin's landlord is Diego Alves."), self.memory("Robin's bike is a blue Trek.")
+        with mock.patch.object(mem, "APP_FORGETS_A_DAY", 1):
+            self.assertEqual(mem.hold_swept(self.db, [old], []), ([old], []))
+            self.db.execute("update forget_holds set at = at - 3 * 86400")
+            self.db.commit()
+            self.assertTrue(self.seen(time.time()))
+            self.assertEqual(mem.hold_swept(self.db, [new], []), ([new], []))
+
+    def test_a_list_line_and_a_chinese_sentence_holding_it_are_asked_about(self):
+        """_sentences glues short lines and knows only . ! ? (review 2026-11-10: a bullet list and a Chinese paragraph
+        holding the exact sentence were cut before the model saw them)."""
+        self.claim("Diego Alves is Robin's landlord.")
+        listed = self.memory("Flat in Porto:\n- Floor: third, no lift\n- Rent: 950 euros\n- Landlord: Diego Alves")
+        self.ask_forget(confirm=("Landlord",))
+        self.assertEqual(self.row(listed)["status"], "held")
+        self.claim("\u8fea\u6208\u662f\u7f57\u5bbe\u7684\u623f\u4e1c\u3002")
+        zh = self.memory("\u7f57\u5bbe\u4e09\u6708\u642c\u5230\u6ce2\u5c14\u56fe\u3002\u8fea\u6208\u662f\u7f57\u5bbe\u7684"
+                         "\u623f\u4e1c\u3002\u516c\u5bd3\u6709\u4e24\u95f4\u5367\u5ba4\u3002")
+        self.ask_forget("\u8fea\u6208", pick=lambda p: {"forget": [self.num(p, "\u8fea\u6208")], "mixed": []},
+                        confirm=("\u8fea\u6208",), session="desk2")
+        self.assertEqual(self.row(zh)["status"], "held")
+
+    def test_a_memory_holding_the_forgotten_words_is_read_even_when_its_chunk_is_not_among_the_nearest(self):
+        """One sentence in a long chunk: the chunk as a whole can rank behind many shorter memories on the subject,
+        past what is read (review 2026-11-10: 1.6% of exact sentences missed on a 276-chunk store, 4.7% at 559).
+        The keyword index finds it whatever its rank."""
+        self.claim("Diego Alves is Robin's landlord.")
+        self.memory("Robin's landlord wrote about the boiler.")
+        long = self.memory(" ".join(f"Crate {n} holds tins." for n in range(30)) + " Robin's landlord is Diego Alves.")
+        with mock.patch.object(mem, "SWEEP_HOLD_K", 1), mock.patch.object(mem, "SWEEP_READ", 1):
+            self.ask_forget()
+        self.assertEqual(self.row(long)["status"], "held")
+
+    def test_a_sentence_after_a_closing_quote_is_read_on_its_own(self):
+        """_sentences splits after . ! ? only before a space: a sentence after a quoted one stayed glued to it."""
+        self.claim("Diego Alves is Robin's landlord.")
+        quoted = self.memory('Robin wrote "ask the agency about the boiler and the heating." '
+                             "Robin's landlord is Diego Alves.")
+        self.ask_forget()
+        self.assertEqual(self.row(quoted)["status"], "held")
+
+    def test_a_memory_only_somewhat_like_a_forgotten_claim_is_not_asked_about(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        self.memory("Robin's landlord is Diego Alves.")
+        far = self.memory("Diego Alves visited Robin yesterday morning.")  # about 0.6: under SWEEP_NEAR
+        llm = self.ask_forget(confirm=("Diego",))
+        self.assertNotIn("yesterday", self.asked(llm)[0])
+        self.assertEqual(self.row(far)["status"], "active")
+
+    def test_a_scoped_sweep_reaches_only_memories_its_scope_may_see(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        seen_, hidden = self.memory("Robin's landlord is Diego Alves."), self.memory("Diego Alves is Robin's landlord now.")
+        with self.db:
+            self.db.execute("update memories set section = 'projects' where id = ?", (seen_,))
+            self.db.execute("update memories set section = 'people' where id = ?", (hidden,))
+        st = {}
+        with mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []},
+                                                        memories=lambda p: {"forget": [n for n, _ in self.listed(p)]})):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, scope=LIMITED,
+                     memories=True)
+        self.assertEqual(st["memories"], [seen_])
+        self.assertEqual(self.row(hidden)["status"], "active")
+
+    def test_a_hold_that_no_longer_stands_gives_its_place_in_the_days_allowance_back(self):
+        a = mem.remember(self.db, "Robin's landlord is Diego Alves.", origin="owner_typed", source="notes/home.md")[0]
+        b, c = self.memory("Robin's bike is a blue Trek."), self.memory("Robin's sister Bea lives in Lisbon.")
+        with mock.patch.object(mem, "APP_FORGETS_A_DAY", 1):
+            self.assertEqual(mem.hold_swept(self.db, [a], []), ([a], []))
+            mem.remember(self.db, "Robin's landlord is Diego Alves. Rent is due on the first.", origin="owner_typed",
+                         source="notes/home.md")  # its file changed: active again, its hold row left behind
+            self.assertEqual(mem.hold_swept(self.db, [b], []), ([b], []))
+            self.assertTrue(mem.restore(self.db, b))  # and one the user restored
+            self.assertEqual(mem.hold_swept(self.db, [c], []), ([c], []))
+
+    def test_the_users_forget_of_one_hidden_memory_leaves_the_others_hidden(self):
+        a, b = self.memory("Robin's landlord is Diego Alves."), self.memory("Robin's bike is a blue Trek.")
+        self.assertEqual(mem.hold_swept(self.db, [a, b], []), ([a, b], []))
+        self.assertTrue(mem.forget_reply(self.db, a).startswith(f"Deleted #{a} for good"))
+        self.assertEqual((self.row(b)["status"], self.row(b)["content"]), ("held", "Robin's bike is a blue Trek."))
+        self.assertEqual(mem.swept(self.db), [b])
+
+    def test_memories_like_it_beyond_those_shown_are_named_in_the_counts(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        looser = self.memory("Diego Alves is the landlord of Robin's flat.")
+        exact = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "SWEEP_SHOWN", 1), \
+                mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []}, memories={"forget": [1]})):
+            cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st, memories=True)
+        self.assertEqual((st["memories"], st["memories_unasked"]), ([exact], [looser]))
+
+    def test_a_failure_after_the_claims_went_does_not_fail_the_slice(self):
+        cid = self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        st = {}
+        with mock.patch.object(mem, "hold_swept", side_effect=sqlite3.OperationalError("database is locked")), \
+                mock.patch.object(mem, "llm_json", FakeLLM(pick={"forget": [1], "mixed": []}, memories={"forget": [1]})):
+            self.assertEqual(cs.sweep(mem, self.db, "please forget everything about Diego", ["Diego"], [cid], st=st,
+                                      memories=True), 1)
+        self.assertEqual(st["memories_unchecked"], [note])
+
+    def test_a_long_memory_is_shown_cut_with_the_sentence_that_matched(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        self.memory("Robin's landlord is Diego Alves. " + " ".join(f"Shelf {n} holds jars." for n in range(400)))
+        late = self.memory(" ".join(f"Crate {n} holds tins." for n in range(400)) + " Robin's landlord is Diego Alves.")
+        llm = self.ask_forget()
+        lines = [line for _, line in self.listed(self.asked(llm)[0])]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(len(line) < cs.MEMORY_SHOWN + 400 for line in lines), [len(x) for x in lines])
+        self.assertTrue(all("landlord is Diego Alves" in line for line in lines))
+        self.assertEqual(self.row(late)["status"], "held")
+
+    def test_a_memory_the_sweep_held_comes_back_with_restore(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        back = self.memory("Robin's landlord is Diego Alves.")
+        self.ask_forget()
+        self.assertTrue(mem.restore(self.db, back))
+        self.assertEqual(self.row(back)["status"], "active")
+        self.assertIn("landlord", mem.prompt_context(self.db, "who is Robin's landlord Diego Alves", "later") or "")
+
+    def test_a_memory_restating_a_claim_the_sweep_rewrites_can_be_held(self):
+        self.claim("Robin has a dentist appointment on Friday at 3 pm for a root canal.")
+        both = self.memory("Robin has a dentist appointment on Friday at 3 pm for a root canal.")
+        kept = self.memory("Robin has a dentist appointment on Friday at 3 pm.")
+        self.ask_forget("the root canal", pick=lambda p: {"forget": [], "mixed": [self.num(p, "dentist")]},
+                        confirm=("root canal",),
+                        rewrite={"kept": "Robin has a dentist appointment on Friday at 3 pm.",
+                                 "removed": "root canal", "sure": True})
+        self.assertEqual(self.row(both)["status"], "held")
+        self.assertEqual(self.row(kept)["status"], "active")  # it never held the forgotten part
+
+    def test_when_the_pick_call_fails_the_extractors_picks_go_and_their_memories_are_asked_about(self):
+        self.claim("Diego Alves is Robin's landlord.")
+        note = self.memory("Robin's landlord is Diego Alves.")
+        self.slice(["please forget everything about Diego"],
+                   lambda p: {"claims": [], "forget": [self.num(p, "Diego")]},
+                   topics={"topics": ["Diego"]}, pick=RuntimeError("no model"), memories={"forget": [1]})
+        self.assertIsNone(self.by_text("Diego"))
+        self.assertEqual(self.row(note)["status"], "held")
+
+    def test_forgetting_a_memory_by_id_still_leaves_merely_similar_memories_alone(self):
+        """forget_ids reaches true copies only (DUP_SIM); its sweep is not a request in the user's words."""
+        mid = self.memory("Robin's sister Bea is pregnant with twins")
+        self.claim("Bea is expecting twins in May and wants a quiet summer.")
+        similar = self.memory("Bea is expecting twins in May and wants a quiet summer.")
+        self.assertTrue(mem.forget(self.db, mid))
+        llm = FakeLLM(pick=lambda p: {"forget": [self.num(p, "expecting")], "mixed": []}, memories={"forget": [1]})
+        with mock.patch.object(mem, "llm_json", llm):
+            cs.claims_tick(mem, self.db, log=lambda m: None, paused=True)
+        self.assertIsNone(self.by_text("expecting"))  # the sweep did forget the claim
+        self.assertEqual(self.row(similar)["status"], "active")
+        self.assertEqual(self.asked(llm), [])
 
     def test_coding_words_are_not_a_forget_request(self):
         self.claim("Robin's favourite colour is green.")

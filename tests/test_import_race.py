@@ -70,6 +70,31 @@ class Race(DBCase):
         self.assertEqual(sum(r["added"] for r in results), 40)  # each note once, whichever import wrote it
         self.assertEqual(tuple(self.db.execute("select count(distinct source), count(*) from memories").fetchone()), (40, 40))
 
+    def test_threads_making_the_source_secret_at_once_all_get_the_same_one(self):
+        """The two imports above failed about 1 run in 15 (FileNotFoundError): both threads wrote the secret to one
+        temp file name, and the second linked it after the first had removed it."""
+        path = mem.paths().source_secret
+        for _ in range(20):
+            path.unlink(missing_ok=True)
+            mem._SOURCE_SECRET.pop(str(path), None)
+            start, got, errors = threading.Barrier(8), [], []
+
+            def make():
+                try:
+                    start.wait(10)
+                    got.append(mem._source_secret())
+                except Exception as e:
+                    errors.append(e)
+            threads = [threading.Thread(target=make) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            self.assertEqual(errors, [])
+            self.assertEqual(set(got), {path.read_bytes()})
+            self.assertEqual(len(path.read_bytes()), 32)
+            self.assertEqual([f.name for f in path.parent.glob(path.name + ".*")], [])  # no temp file left
+
     def test_a_refused_note_never_stops_the_import(self):
         home = Path(tempfile.mkdtemp(prefix="race-home"))
         d = notes(home, 2)

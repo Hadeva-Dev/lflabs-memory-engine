@@ -1,6 +1,6 @@
 [project]
 name = "lflabs-memory-engine"
-version = "0.1.9"
+version = "0.1.10"
 description = "Local long-term memory for AI assistants: SQLite + vectors + keyword search"
 readme = "README.md"
 authors = [{ name = "LF Labs" }]

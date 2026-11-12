@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.10 (2026-11-12)
+
+- "Forget that" said in conversation now also hides the saved memories that say the same thing. Before, the short
+  facts about it were erased and a saved memory restating it stayed active and went on being put into prompts.
+  One model call decides which memories restate what was forgotten; those are hidden from every app at once, ten a
+  day at most. You are shown one line naming them by number, on the start screen in the Claude Code terminal and
+  with your message elsewhere: `forget N` deletes one for good now, `restore N` brings it back. Otherwise each is
+  deleted for good 30 days after you were first told of it, and never if you were not told. An AI app's shell can
+  neither delete nor bring back a memory hidden this way (it is refused, with exit code 1).
+- Two imports running at once in one process no longer fail with "No such file or directory" (they shared a
+  temporary file name).
+
 ## 0.1.9 (2026-11-11)
 
 - An app set to see nothing gets nothing in its prompts either. A Codex or Cursor that had once been allowed more

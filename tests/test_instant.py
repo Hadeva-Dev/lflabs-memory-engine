@@ -10,6 +10,7 @@ import _env  # noqa: F401  (first: the test data folder and user)
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -443,6 +444,297 @@ class NeverUnasked(Case):
         self.assertIn(" held` to see and confirm them.", first)
         self.assertNotIn("nightly batch", first)
         self.assertNotIn("waiting for you", start("b"))  # once a day
+
+    HUMAN = {"turnOrigin": "human", "origin": {"kind": "human"}}  # as the desktop app tags a turn a person typed
+
+    @staticmethod
+    def stamp(at):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(at)) + f".{int(at % 1 * 1000):03d}Z"
+
+    def line_of(self, sid, d):
+        path = self.ccprojects / "-orchard" / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps({"uuid": f"u{time.time_ns()}", "sessionId": sid, **d}) + "\n")
+
+    def turn(self, sid, text, at, **tags):
+        """One user-role line in the session's own transcript, stamped at, tagged as Claude Code tags it."""
+        self.line_of(sid, {"type": "user", "timestamp": self.stamp(at), "message": {"role": "user", "content": text}, **tags})
+
+    @staticmethod
+    def undated(line):
+        """The line without its date: said before the user was told it counts 30 days from now, after from the
+        telling, and the two are a day apart when a test runs across midnight (review round 10)."""
+        return re.sub(r"\(on \d{4}-\d\d-\d\d\)", "(on DATE)", line)
+
+    def noticed(self, sid, event, text, at, entrypoint=None):
+        """Claude Code's own record that a hook's systemMessage was taken for the user's screen."""
+        self.line_of(sid, {"type": "attachment", "timestamp": self.stamp(at),
+                           "entrypoint": entrypoint or os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                           "attachment": {"type": "hook_system_message", "content": text, "hookName": event,
+                                          "hookEvent": event}})
+
+    def said(self, sid, event="UserPromptSubmit", prompt="what next?", at=None):
+        """What a hook of the session says to the user's screen (systemMessage), "" if nothing. at: when Claude Code
+        records having taken it, as it does for a real hook; None for a hook something else called."""
+        out = io.StringIO()
+        with redirect_stdout(out):
+            if event == "SessionStart":
+                mem.hook_session_start({**self.cc(sid, event), "source": "startup", "cwd": str(self.repo), "session_id": sid})
+            elif event == "Stop":
+                mem.hook_activity({**self.cc(sid, event), "session_id": sid, "cwd": str(self.repo)})
+            else:
+                mem.hook_prompt({"prompt": prompt, "session_id": sid, "cwd": str(self.repo), **self.cc(sid)})
+        text = json.loads(out.getvalue() or "{}").get("systemMessage", "")
+        if text and at is not None:
+            self.noticed(sid, event, text, at)
+        return text
+
+    def hidden(self, text="Robin's landlord is Diego Alves."):
+        """A memory the claims sweep hid; (its id, a time just after)."""
+        mid, _ = mem.remember(self.db, text, origin="owner_typed")
+        self.assertEqual(mem.hold_swept(self.db, [mid], []), ([mid], []))
+        return mid, time.time() + 1
+
+    def told(self):
+        return mem._sweep_told(self.db)
+
+    def test_the_terminal_start_tells_the_user_what_a_forget_request_hid_once_they_type_with_it_on_screen(self):
+        """A memory the claims sweep hid after a forget asked for in conversation (mem.hold_swept): the line is for
+        the user's screen (systemMessage), not only the model's context. A start alone tells no one, nor does a
+        first prompt stamped with the line (seen in the terminal app, 2.1.322: 0.01 s after it), which may be the
+        prompt given on the command line, sent before the line could be read (review 2026-11-10). A turn typed
+        later does, at that turn's time."""
+        mid, t0 = self.hidden()
+        said = self.said("a", "SessionStart", at=t0)
+        self.assertIn(f"#{mid}", said)
+        self.assertIn(f" forget {mid}`", said)
+        self.assertIn(f" restore {mid}`", said)
+        self.assertNotIn("Diego", said)
+        self.assertEqual(self.said("b", "SessionStart", at=t0 + 1), said)  # nobody typed in a: the next start shows it too
+        self.said("b", "Stop")
+        self.assertEqual(self.told(), {})
+        self.turn("b", "fix the build", t0 + 1.01)  # the first prompt, or `claude "fix the build"`
+        self.said("b", "Stop")
+        self.assertEqual(self.told(), {})
+        self.turn("b", "ok, thanks", t0 + 40)
+        self.turn("b", "and one more thing", t0 + 90)
+        self.said("b", "Stop")
+        self.assertEqual(list(self.told()), [mid])
+        self.assertAlmostEqual(self.told()[mid], t0 + 40, delta=0.01)  # the first such turn's time
+        self.assertEqual(self.undated(self.said("c", "SessionStart", at=t0 + 100)), self.undated(said))  # told, and
+        # still said at every start while it waits
+        self.assertEqual(self.said("c"), "")  # the terminal's start said it: not again at a prompt
+        self.assertEqual(self.db.execute("select status from memories where id = ?", (mid,)).fetchone()[0], "held")
+
+    def test_a_run_with_nobody_at_a_screen_is_shown_nothing_and_tells_no_one(self):
+        """`claude -p` and SDK runs fire the same hooks with nobody at a screen (review 2026-11-10: a scripted daily
+        run counted as telling the user), as do Claude Code's MCP server and a CI action. Even with the line and a
+        turn in the transcript, such a run's Stop tells no one."""
+        mid, t0 = self.hidden()
+        for entry in ("sdk-cli", "sdk-py", "mcp", "claude-code-github-action"):
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": entry}):
+                self.assertEqual(self.said(entry, "SessionStart", at=t0), "", entry)
+                self.assertEqual(self.said(entry, at=t0), "", entry)
+                self.noticed(entry, "UserPromptSubmit", mem.sweep_notice(self.db, entry), t0, entrypoint="claude-desktop")
+                self.turn(entry, "run the nightly job", t0 + 30, **self.HUMAN)
+                self.said(entry, "Stop")
+                self.assertEqual(self.told(), {}, entry)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.said("sdk-cli", "Stop")  # the same transcript at a screen: the control
+        self.assertEqual(list(self.told()), [mid])
+
+    def test_the_desktop_app_is_told_at_a_prompt_because_it_drops_what_a_start_says(self):
+        """Checked 2026-11-10 (Claude desktop, Claude Code 2.1.317): a SessionStart hook's systemMessage never reaches
+        the desktop app's screen; a UserPromptSubmit hook's does. A start there shows nothing and tells no one; the
+        session's prompt carries the line, and the user is told once they have typed after it. The prompt that
+        brought it up was typed before it was on screen (commit review 2026-11-10): it tells no one, and the next
+        prompt carries the line again."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.assertEqual(self.said("d", "SessionStart", at=t0), "")
+            self.turn("d", "hello", t0 + 1, **self.HUMAN)
+            self.said("d", "Stop")
+            self.assertEqual(self.told(), {})  # typed in, but the line was never on their screen
+            self.turn("d", "what next?", t0 + 10, **self.HUMAN)
+            line = self.said("d", prompt="what next?", at=t0 + 10.07)
+            self.assertIn(f"#{mid}", line)
+            self.assertIn(f" forget {mid}`", line)
+            self.assertIn(f" restore {mid}`", line)
+            self.assertNotIn("Diego", line)
+            self.said("d", "Stop")
+            self.assertEqual(self.told(), {})  # typed before the line it brought up
+            self.turn("d", "and after that?", t0 + 60, **self.HUMAN)
+            self.assertEqual(self.said("d", prompt="and after that?", at=t0 + 60.07), line)
+            self.said("d", "Stop")
+            self.assertEqual(list(self.told()), [mid])
+            self.assertAlmostEqual(self.told()[mid], t0 + 60, delta=0.01)
+            self.assertEqual(self.said("d", prompt="ok"), "")  # told, and shown in this session: not at every prompt
+            self.assertEqual(self.undated(self.said("e")), self.undated(line))  # each session's first prompt while
+            # it waits, as each start is
+            self.assertEqual(self.said("e"), "")
+        self.assertEqual(self.db.execute("select status from memories where id = ?", (mid,)).fetchone()[0], "held")
+
+    def test_many_sessions_do_not_bring_the_line_back_at_every_prompt(self):
+        """Review 2026-11-10: 20 sessions' showings were kept, and with a 21st in use each prompt of each carried it."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.turn("me", "hello", t0, **self.HUMAN)
+            self.said("me", prompt="hello", at=t0 + 0.1)
+            self.turn("me", "go on", t0 + 30, **self.HUMAN)
+            self.said("me", "Stop")
+            self.assertEqual(list(self.told()), [mid])
+            first = [bool(self.said(f"s{n}")) for n in range(25)]
+            again = [bool(self.said(f"s{n}")) for n in range(25)] + [bool(self.said("me"))]
+        self.assertEqual((all(first), any(again)), (True, False))
+
+    def test_a_session_says_it_again_when_what_waits_has_changed(self):
+        a, _ = self.hidden()
+        b, t0 = self.hidden("Robin's dentist is Dr. Okafor.")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.turn("d", "hello", t0, **self.HUMAN)
+            self.assertIn(f"#{a}, #{b}", self.said("d", prompt="hello", at=t0 + 0.1))
+            self.turn("d", "go on", t0 + 30, **self.HUMAN)
+            self.said("d", "Stop")
+            self.assertEqual(sorted(self.told()), [a, b])
+            self.assertEqual(self.said("d"), "")
+            self.assertTrue(mem.restore(self.db, a))
+            again = self.said("d")
+        self.assertIn(f"#{b}", again)
+        self.assertNotIn(f"#{a}", again)
+
+    def test_the_terminal_app_says_it_at_the_start_and_not_again_at_a_prompt(self):
+        mid, t0 = self.hidden()
+        self.assertIn(f"#{mid}", self.said("t", "SessionStart", at=t0))
+        self.assertEqual(self.said("t"), "")
+
+    def test_a_message_another_session_wrote_is_not_the_user_typing(self):
+        """A session an agent started opens with that agent's brief: a user-role line with no origin and turnOrigin
+        "sdk" (Claude Code 2.1.317). Neither it nor a later agent's message after the line tells anyone, so the
+        next prompt carries the line again, until a turn of the user's own follows one."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.turn("g", "Background: tidy the orchard README.", t0, turnOrigin="sdk", origin=None)
+            line = self.said("g", prompt="Background: tidy the orchard README.", at=t0 + 0.1)
+            self.assertIn(f"#{mid}", line)
+            self.turn("g", "Status from the build session: green.", t0 + 60, turnOrigin="peer", origin=None)
+            self.said("g", "Stop")
+            self.assertEqual(self.told(), {})
+            self.turn("g", "thanks, go on", t0 + 90, **self.HUMAN)
+            self.assertEqual(self.said("g", prompt="thanks, go on", at=t0 + 90.1), line)  # nobody told yet: said again
+            self.said("g", "Stop")
+            self.assertEqual(list(self.told()), [mid])
+
+    def test_a_turn_typed_before_a_prompt_brought_the_line_tells_no_one(self):
+        """The user types, then an agent's message in the same session brings the line up seconds later: their
+        turn came first."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.turn("p", "morning", t0, **self.HUMAN)
+            self.turn("p", "Status from the build session: green.", t0 + 10, turnOrigin="peer", origin=None)
+            self.assertIn(f"#{mid}", self.said("p", prompt="Status from the build session: green.", at=t0 + 10.1))
+            self.said("p", "Stop")
+            self.assertEqual(self.told(), {})
+
+    def test_a_hook_something_else_called_tells_no_one(self):
+        """A hook call is JSON on stdin and an environment: anything running as the user, an AI app's shell too, can
+        make one. What it prints is on nobody's screen and Claude Code records nothing, so a turn typed after it
+        does not tell (review 2026-11-10: a forged start under the terminal's entrypoint, or a forged prompt before
+        the real one, made the prompt that brought the line up count)."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.assertIn(f"#{mid}", self.said("w", prompt="zz-never-typed"))  # forged: no record in the transcript
+            self.turn("w", "what next?", t0 + 10, **self.HUMAN)
+            self.assertIn(f"#{mid}", self.said("w", prompt="what next?", at=t0 + 10.07))
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
+                self.assertIn(f"#{mid}", self.said("w", "SessionStart"))  # forged, as the terminal app
+                self.said("w", "Stop")
+            self.said("w", "Stop")
+            self.assertEqual(self.told(), {})
+            self.turn("x", "typed in a session the line never reached", t0 + 30, **self.HUMAN)
+            self.assertIn(f"#{mid}", self.said("x", prompt="zz-never-typed"))
+            self.said("x", "Stop")
+            self.assertEqual(self.told(), {})
+
+    def test_a_start_line_the_desktop_app_recorded_but_never_drew_tells_no_one(self):
+        """The desktop app's transcript does record a SessionStart hook's message (2.1.317), and its screen never
+        has it: only the terminal app's start line counts, by the line's own entrypoint."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            line = mem.sweep_notice(self.db, "q")
+            self.noticed("q", "SessionStart", line, t0)
+            self.noticed("q", "Stop", line, t0)
+            self.line_of("q", {"type": "attachment", "timestamp": self.stamp(t0),  # a start's line that names no client
+                               "attachment": {"type": "hook_system_message", "content": line, "hookEvent": "SessionStart"}})
+            self.line_of("q", {"type": "attachment", "timestamp": self.stamp(t0), "entrypoint": "claude-desktop",
+                               "attachment": {"type": "hook_additional_context", "content": line,  # for the model, not the screen
+                                              "hookEvent": "UserPromptSubmit"}})
+            self.turn("q", "hello", t0 + 60, **self.HUMAN)
+            self.said("q", "Stop")
+        self.assertEqual(self.told(), {})
+
+    def test_words_that_only_read_like_the_line_tell_no_one(self):
+        """The hook's message can quote what an app saved (the reply to a typed `confirm memory N`): an app's save
+        reading "... hidden from every app: #1. ..." started #1's 30 days in a session the real line never reached
+        (review 2026-11-10). Only the engine's own line, opening the message, is the line."""
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            line = mem.sweep_notice(self.db, "v")
+            self.noticed("v", "UserPromptSubmit", f'{mem.LABEL}: #2, which an app saved, reads "Vendor portal status: all '
+                         f'clear, hidden from every app: #{mid}. Nothing to do." Confirm it?', t0)
+            self.noticed("v", "UserPromptSubmit", f"{mem.LABEL}: #2, which an app saved, reads:\n{line}", t0)
+            self.turn("v", "ok", t0 + 30, **self.HUMAN)
+            self.said("v", "Stop")
+            self.assertEqual(self.told(), {})
+            self.noticed("v", "UserPromptSubmit", f"{line}\n{mem.LABEL}: saved.", t0 + 40)  # the line, then another
+            self.turn("v", "ok", t0 + 60, **self.HUMAN)
+            self.said("v", "Stop")
+        self.assertEqual(list(self.told()), [mid])
+
+    def test_a_long_turn_between_the_line_and_the_end_does_not_lose_it(self):
+        """The terminal's line is at the top of the transcript and one turn's output runs to megabytes: with only
+        the transcript's end read, such a session could never tell (review 2026-11-10: about half of real ones)."""
+        mid, t0 = self.hidden()
+        self.said("big", "SessionStart", at=t0)
+        self.turn("big", "refactor the importer", t0 + 40)
+        for n in range(30):
+            self.line_of("big", {"type": "assistant", "timestamp": self.stamp(t0 + 41 + n),
+                                 "message": {"role": "assistant", "content": [{"type": "text", "text": "x" * 60000}]}})
+        self.said("big", "Stop")
+        self.assertEqual(list(self.told()), [mid])
+
+    def test_a_scheduled_tasks_prompt_is_not_the_user_typing_whatever_its_tag(self):
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.noticed("sch", "UserPromptSubmit", mem.sweep_notice(self.db, "sch"), t0)
+            self.turn("sch", '<scheduled-task name="nightly-check">Run the nightly check.</scheduled-task>', t0 + 30, **self.HUMAN)
+            self.said("sch", "Stop")
+        self.assertEqual(self.told(), {})
+
+    def test_claude_codes_own_interrupt_line_is_not_the_user_typing(self):
+        mid, t0 = self.hidden()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}):
+            self.turn("i", "Status from the build session: green.", t0, turnOrigin="peer", origin=None)
+            self.said("i", prompt="Status from the build session: green.", at=t0 + 0.1)
+            self.turn("i", "[Request interrupted by user]", t0 + 20)
+            self.turn("i", "[Request interrupted by user for tool use]", t0 + 30)
+            self.said("i", "Stop")
+        self.assertEqual(self.told(), {})
+
+    def test_only_a_turn_the_user_typed_is_a_typed_turn(self):
+        for n, tags in enumerate(({"turnOrigin": "sdk"}, {"turnOrigin": "peer"}, {"turnOrigin": "scheduled"},
+                                  {"turnOrigin": "task_notification"}, {"turnOrigin": "auto_continuation"},
+                                  {"turnOrigin": "host_synthetic"}, {"turnOrigin": "system"},
+                                  {"promptSource": "sdk"})):  # the last: an SDK's prompt before turns were tagged
+            self.turn("k", f"forget memory {n}", time.time(), **tags)
+        path = str(self.ccprojects / "-orchard" / "k.jsonl")
+        self.assertEqual(mem._typed_turns(path, "k", "desk"), [])
+        self.turn("k", "forget memory 8", time.time(), **self.HUMAN)
+        self.turn("k", "forget memory 9", time.time())  # a Claude Code that does not tag turns
+        self.turn("k", "forget memory 10", time.time(), promptSource="sdk", origin={"kind": "human"})  # the desktop app then
+        self.turn("k", "forget memory 11", time.time(), promptSource="sdk", turnOrigin="human")
+        self.assertEqual([t[2] for t in mem._typed_turns(path, "k", "desk")],
+                         ["forget memory 8", "forget memory 9", "forget memory 10", "forget memory 11"])
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ for the next agent that works in the same project.
 import functools
 import hashlib
 import hmac
+import itertools
 import json
 import math
 import os
@@ -540,7 +541,9 @@ def _source_secret():
         got = b""
     if len(got) < 32:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        # its own name per thread: two imports in one process (the daemon's worker and a request) shared one, and
+        # the second's link found the file the first had just removed (FileNotFoundError, test_import_race 7 in 100)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(os.urandom(32))
@@ -3242,8 +3245,34 @@ def _newest_typed_turn(path, session_id, speaker):
     return turns[-1] if turns else None
 
 
-def _typed_turns(path, session_id, speaker):
-    """[(time, turn id, text)] of the user's typed turns in the session's own transcript, oldest first; [] if none."""
+# Claude Code's turnOrigin of a user-role line nobody typed. A session another session started opens with that
+# session's brief: no origin, turnOrigin "sdk" (2.1.317, checked 2026-11-10), which read as the user typing.
+AGENT_TURNS = ("sdk", "scheduled", "task_notification", "auto_continuation", "peer", "host_synthetic", "system")
+
+
+def _agent_turn(line):
+    """Whether a transcript line is a user-role turn Claude Code marks as not typed by a person (AGENT_TURNS). A
+    Claude Code that tagged no turnOrigin (2.1.220) wrote an SDK's prompt with promptSource "sdk" and no origin, and
+    a person's desktop prompt with promptSource "sdk" and origin human (review 2026-11-10: 71 such SDK prompts read
+    as typed)."""
+    if '"turnOrigin"' not in line and '"promptSource"' not in line:
+        return False
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return False
+    if not isinstance(d, dict) or d.get("type") != "user":
+        return False
+    if d.get("turnOrigin") in AGENT_TURNS:
+        return True
+    origin = d.get("origin") if isinstance(d.get("origin"), dict) else {}
+    return "turnOrigin" not in d and d.get("promptSource") == "sdk" and origin.get("kind") != "human"
+
+
+def _typed_turns(path, session_id, speaker, lines=None):
+    """[(time, turn id, text)] of the user's typed turns in the session's own transcript, oldest first; [] if none.
+    Never a turn Claude Code marks as an agent's or its own (_agent_turn). lines: that transcript's lines, when the
+    caller read more than its end (sweep_seen)."""
     if not path or not session_id:
         return []
     p = Path(path)
@@ -3255,12 +3284,15 @@ def _typed_turns(path, session_id, speaker):
             real = p.resolve()
             if real.name != f"{session_id}.jsonl" or real.parent.parent != Path(CLAUDE_PROJECTS).resolve():
                 return []
-        size = p.stat().st_size
-        with p.open("rb") as f:
-            if size > FOLLOWUP_TAIL and speaker != "codex":
-                f.seek(size - FOLLOWUP_TAIL)
-                f.readline()
-            lines = f.read().decode("utf-8", errors="ignore").splitlines()
+        if lines is None:
+            size = p.stat().st_size
+            with p.open("rb") as f:
+                if size > FOLLOWUP_TAIL and speaker != "codex":
+                    f.seek(size - FOLLOWUP_TAIL)
+                    f.readline()
+                lines = f.read().decode("utf-8", errors="ignore").splitlines()
+        if speaker != "codex":
+            lines = [x for x in lines if not _agent_turn(x)]
         turns = _followup_turns(str(p), lines, ids=True)
     except (OSError, ValueError):
         return []
@@ -3371,6 +3403,335 @@ def run_by_agent(env=None):
     return any(env.get(k) for k in AGENT_ENV)
 
 
+def _hold(db, m, vecs, client, now, claims, scope):
+    """One active memory hidden until purge_holds deletes it or `restore` brings it back: True if it was (one that
+    is no longer active is left as it is). Caller holds the transaction."""
+    if not db.execute("update memories set status = 'held' where id = ? and status = 'active'", (m,)).rowcount:
+        return False
+    if m in vecs:
+        forgot_put(db, "forgot_vec", m, vecs[m])  # not saved again meanwhile
+    db.execute("delete from chunks where memory_id = ?", (m,))  # out of search; mem_vec stays for the purge
+    db.execute("insert or replace into forget_holds values ('memory', ?, ?, ?, ?, ?)",
+               (m, client, now, json.dumps(claims), scope))
+    return True
+
+
+# ---------- a forget asked for in conversation: the memories saying the same thing ----------
+# "please forget everything about Diego" reached the claims only (claimstore.sweep): a memory saying the same thing
+# stayed and went on being injected (memory-bench 2026-11-09: 4 of 6 forget leaks). Now the memories like a claim the
+# sweep forgot are shortlisted here (restating), one more model call says which of them hold what was asked to be
+# forgotten (claimstore._memories: likeness alone held "20 mg" for "10 mg" and a September appointment for a March
+# one, review 2026-11-10), and those are held (hold_swept): hidden at once from every search and hook, their text
+# kept in their own rows. They were found, not named, and that call is wrong a few times in a hundred, so none is
+# erased before the user has been told: a line on their screen at every session's start while one waits
+# (sweep_notice), which counts only once they have typed in that same session after it (sweep_seen, at its Stop hook,
+# from the session's own transcript: a hook call is only JSON on stdin, review 2026-11-10). Only Claude Code's terminal app shows what a start hook says
+# (start_shows); anywhere else the line comes with a prompt (_sweep_due). Their own forget of its id
+# deletes it for good at once (forget_reply), their restore brings it back, and SWEEP_EXPIRY after they were first
+# told of it purge_holds deletes it for good (the owner's decision 2026-11-10: long enough to be told many times).
+# A memory nobody was told of is never erased. No cascade from a held memory: the sweep is the cascade. A slice carries no scope, so this
+# reaches memories of every scope, as the conversational sweep already reaches every claim.
+SWEEP_HOLDS = "forget sweep"  # forget_holds.client of such a hold: no app can take the name (CLIENT_RE has no space)
+SWEEP_EXPIRY = 30 * 86400    # such a hold is deleted for good this long after the user was first told of it
+SWEEP_NEAR = 0.75    # a memory this like a forgotten claim, as a whole or in one sentence or line, is asked about
+SWEEP_HOLD_K = 200   # chunks looked at for each forgotten claim
+SWEEP_READ = 100     # chunks whose sentences and lines are read for one request, at most: the nearest
+SWEEP_WORDS = 60     # and as many chunks more, found by the forgotten claims' own words
+SWEEP_SHOWN = 12     # memories one request asks the model about, at most: the nearest (claimstore._memories)
+
+
+def _pieces(text):
+    """A memory's sentences as _sentences gives them and also each on its own, with its lines and the sentences
+    Chinese and Japanese end with \u3002\uff01\uff1f: _sentences glues a short sentence or line onto the one before
+    ("- Landlord: Diego Alves" in a list) and knows only . ! ? right before a space, not before a closing quote or
+    bracket ('... the heating." Robin's landlord is ...')."""
+    out = list(_sentences(text))
+    for part in re.split(r"(?<=[.!?])[\"'\u201d\u2019)\]]*\s+|\n+|(?<=[\u3002\uff01\uff1f])", str(text)):
+        if part.strip() and part.strip() not in out:
+            out.append(part.strip())
+    return out
+
+
+def restating(db, vecs, scope=None, texts=()):
+    """The active memories this scope may see that are like a forgotten claim (vecs: the claims' embeddings, read
+    before they went; texts: their words): [(id, text, the part most like one)], nearest first. Likeness is
+    SWEEP_NEAR for the whole memory or one sentence or line of a chunk that is read: the SWEEP_READ chunks nearest
+    a claim, and SWEEP_WORDS more that the keyword index finds by the claims' own words (one sentence in a long
+    chunk can leave the chunk as a whole far from the claim). It only shortlists."""
+    near = {}  # chunk id: (how near a claim, memory id, its text)
+    for v in vecs:
+        rows = dict(db.execute("select rowid, distance from chunk_vec where embedding match ? and k = ?",
+                               (v.tobytes(), SWEEP_HOLD_K)).fetchall())
+        for cid, mid, text in db.execute(f"select id, memory_id, text from chunks where id in"
+                                         f" ({','.join('?' * len(rows))})", list(rows)).fetchall():
+            if cid not in near or 1 - rows[cid] > near[cid][0]:
+                near[cid] = (1 - rows[cid], mid, text)
+    worded = []  # chunk ids by the claims' words, each claim's best first, taken in turn
+    for t in texts:
+        found = []
+        for table, q in (("chunk_fts", _fts_query(t)), ("chunk_cjk", _cjk().fts_query(t))):
+            if q:
+                found += [r[0] for r in db.execute(f"select rowid from {table} where {table} match ? order by rank"
+                                                   " limit ?", (q, SWEEP_WORDS))]
+        worded.append(found)
+    worded = list(dict.fromkeys(c for turn in itertools.zip_longest(*worded) for c in turn if c is not None))
+    worded = [tuple(r) for r in db.execute(f"select 0.0, memory_id, text from chunks where id in"
+                                           f" ({','.join('?' * len(worded[:SWEEP_WORDS]))})", worded[:SWEEP_WORDS])]
+    mids = {mid for _, mid, _ in list(near.values()) + worded}
+    live = _active(db, list(mids)) & _visible(db, list(mids), scope)
+    read = sorted((c for c in near.values() if c[1] in live), reverse=True)[:SWEEP_READ] \
+        + [c for c in worded if c[1] in live]
+    if not read:
+        return []
+    live = sorted({mid for _, mid, _ in read})
+    text = dict(db.execute(f"select id, content from memories where id in ({','.join('?' * len(live))})", live).fetchall())
+    whole = _vectors(db, live)
+    parts = list(dict.fromkeys((mid, part) for _, mid, chunk in read for part in _pieces(chunk)))
+    found = {m: (max(float(whole[m] @ v) for v in vecs), "") for m in live if m in whole}
+    for (m, part), e in zip(parts, embed([part for _, part in parts]) if parts else []):
+        sim = max(float(e @ v) for v in vecs)
+        if sim > found.get(m, (0.0, ""))[0]:
+            found[m] = (sim, part)
+    out = sorted((m for m in found if found[m][0] >= SWEEP_NEAR), key=lambda m: -found[m][0])
+    return [(m, text[m], found[m][1]) for m in out]
+
+
+def hold_swept(db, mids, vecs, scope=None):
+    """Hold the memories the sweep's model call confirmed (mids, nearest first; see above): (ids held, ids left
+    active). No more in a day than an app may forget (APP_FORGETS_A_DAY, by the time of the hold): the sweep's calls
+    read the whole conversation, and a page quoted in it must not be able to hide the store (security review
+    2026-11-10); what is over stays active and is named in the sweep's counts. Only a true copy of a forgotten
+    claim (DUP_SIM, whole memory) leaves a fingerprint in forgot_vec: one there refuses later saves near it, and a
+    longer memory's would refuse its other facts too. (So a held memory that is no copy can be saved again by an
+    app: remember() does not read the forgotten claims' fingerprints.)"""
+    now, held, left = time.time(), [], []
+    with db:
+        db.execute(FORGET_HOLDS)
+        used = db.execute("select count(*) from forget_holds h join memories m on m.id = h.ref where h.kind = 'memory'"
+                          " and h.client = ? and m.status = 'held' and h.at > ?", (SWEEP_HOLDS, now - 86400)).fetchone()[0]
+        for mid in mids:
+            if used + len(held) >= APP_FORGETS_A_DAY:
+                left += sorted(_active(db, [mid]))
+                continue
+            own = _vectors(db, [mid])
+            copy = mid in own and any(float(own[mid] @ v) >= DUP_SIM for v in vecs)
+            if _hold(db, mid, own if copy else {}, SWEEP_HOLDS, now, [], scope):
+                held.append(mid)
+    return held, left
+
+
+def swept(db, mid=None):
+    """The ids of the memories the claims sweep holds (hold_swept), or whether mid is one. A hold whose memory is no
+    longer held (a file import made it active again) is none."""
+    try:
+        ids = [r[0] for r in db.execute("select h.ref from forget_holds h join memories m on m.id = h.ref where"
+                                        " h.kind = 'memory' and h.client = ? and m.status = 'held' order by h.ref",
+                                        (SWEEP_HOLDS,))]
+    except sqlite3.OperationalError:  # none ever made
+        ids = []
+    return ids if mid is None else mid in ids
+
+
+def under_swept(db, mid):
+    """Whether mid is a memory the sweep holds or an older version merged, at any depth, into one."""
+    held, seen = set(swept(db)), set()
+    while mid is not None and mid not in seen:
+        if mid in held:
+            return True
+        seen.add(mid)
+        row = db.execute("select merged_into from memories where id = ? and status = 'merged'", (mid,)).fetchone()
+        mid = row[0] if row else None
+    return False
+
+
+def _sweep_told(db):
+    """{memory id: when the user was first told the sweep hid it}, for the holds that stand (meta sweep_told: each
+    with its hold's own time, so a memory restored and hidden again starts anew)."""
+    try:
+        at = dict(db.execute("select ref, at from forget_holds where kind = 'memory' and client = ?", (SWEEP_HOLDS,)).fetchall())
+    except sqlite3.OperationalError:  # none ever made
+        return {}
+    return {int(k): v[1] for k, v in _meta_json(db, "sweep_told", {}).items()
+            if isinstance(v, list) and len(v) == 2 and at.get(int(k)) == v[0]}
+
+
+SWEEP_SHOWN_KEPT = 2000  # sessions whose line is remembered (_sweep_due: each once). 20 were kept, and with a 21st
+# session in use every prompt of every session carried the line (review 2026-11-10: 63 of 63)
+
+
+def sweep_notice(db, session_id=None, now=None):
+    """For the user's own eyes at a Claude Code session's start, or with a prompt where a start's words are not
+    shown (start_shows, _sweep_due): a hook's systemMessage, at every start while any
+    memory the claims sweep hid waits: their ids, never their words, the two commands that settle one, and the day
+    the first goes for good. Nothing silences it but settling them: whatever marked a day's line as said could be
+    forged by a process writing as the user, and a silenced line ends in a deletion nobody saw (review 2026-11-10).
+    session_id: the session given it, kept for _sweep_due alone. What tells the user is read from that session's
+    own transcript (sweep_seen), never from a record this call makes: anything can call a hook. "" when there is
+    none."""
+    ids = swept(db)
+    if not ids:
+        return ""
+    now = time.time() if now is None else now
+    if session_id:
+        with db:
+            shown = {**_meta_json(db, "sweep_shown", {}), str(session_id): [now, ids]}
+            shown = dict(sorted(shown.items(), key=lambda kv: kv[1][0])[-SWEEP_SHOWN_KEPT:])
+            db.execute("insert or replace into meta(key, value) values ('sweep_shown', ?)", (json.dumps(shown),))
+    told, many = _sweep_told(db), len(ids) > 1
+    goes = time.strftime("%Y-%m-%d", time.localtime(min(told.get(i, now) for i in ids) + SWEEP_EXPIRY))
+    return (f"{LABEL}: after you asked to forget something, {len(ids)} saved memor{'ies' if many else 'y'} saying "
+            f"the same thing {'are' if many else 'is'} hidden from every app: {', '.join(f'#{i}' for i in ids)}. "
+            f"`{CFG.front} forget {ids[0]}` deletes {'one' if many else 'it'} for good now, `{CFG.front} restore "
+            f"{ids[0]}` brings it back; otherwise {'each' if many else 'it'} is deleted for good "
+            f"{SWEEP_EXPIRY // 86400} days after you "
+            f"were first told of it ({'the first ' if many else ''}on {goes}).")
+
+
+# sweep_notice's line as a transcript has it: the whole opening of the hook's message, never words found further in.
+# The same message can quote what an app saved (the reply to a typed `confirm memory N`), and an app's save reading
+# "... hidden from every app: #1. ..." told the user of #1 (review 2026-11-10); the hooks put this line first.
+SWEEP_LINE_RE = re.compile(rf"\A{re.escape(LABEL)}: after you asked to forget something, \d+ saved memor(?:y|ies) saying "
+                           r"the same thing (?:is|are) hidden from every app: (#\d+(?:, #\d+)*)\. ")
+NO_SCREEN = ("mcp", "claude-code-github-action")  # Claude Code entrypoints with nobody at a screen, besides sdk-*
+
+
+def headless():
+    """A Claude Code run with nobody at a screen (`claude -p`, the SDK, as access.typed_source tests; its MCP
+    server; a CI action)."""
+    entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "")
+    return entry.startswith("sdk") or entry in NO_SCREEN
+
+
+def start_shows():
+    """Claude Code's terminal app: the one client seen to put a SessionStart hook's systemMessage on the user's
+    screen (2.1.322). The desktop app drops it, and draws a UserPromptSubmit hook's (2.1.317, checked 2026-11-10: with
+    the line only at a start, typing there started SWEEP_EXPIRY for a line that was never on screen)."""
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT", "") == "cli"
+
+
+def _sweep_due(session_id):
+    """Whether a prompt of this session owes the user the line, where a start's is not shown (a cheap look, as
+    _typed_waiting): a memory the sweep hid waits, and the user has not been told of each (so it is said again
+    after an agent's message: only their own turn tells them) or this session has not shown the line for those now
+    waiting (each session once, as each start does)."""
+    try:
+        with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2) as ro:
+            ids = swept(ro)
+            if not ids:
+                return False
+            shown = _meta_json(ro, "sweep_shown", {}).get(str(session_id))
+            return bool(set(ids) - set(_sweep_told(ro))) or not shown or shown[1] != ids
+    except sqlite3.Error:  # no store yet
+        return False
+
+
+SWEEP_SCAN = 256 << 20  # bytes of a transcript's end sweep_seen reads, with its first megabyte
+
+
+def _desk_scan(path, session_id):
+    """The lines of a Claude Code session's own transcript that bear on who was told: a hook's message for the user,
+    and user-role lines that are not a tool's output. From the whole file (its first megabyte and SWEEP_SCAN of its
+    end when larger): a start's line is at the top and a turn's tool output runs to megabytes, so with only the
+    end read (FOLLOWUP_TAIL) about half of real terminal sessions could never tell (review 2026-11-10). [] when path
+    is not that session's own file under CLAUDE_PROJECTS (as _typed_turns checks)."""
+    if not path or not session_id:
+        return []
+    p, out = Path(path), []
+    try:
+        real = p.resolve()
+        if real.name != f"{session_id}.jsonl" or real.parent.parent != Path(CLAUDE_PROJECTS).resolve():
+            return []
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            head = size > SWEEP_SCAN + (1 << 20)
+            for raw in f:
+                if b'"hook_system_message"' in raw or (b'"user"' in raw and b'"tool_result"' not in raw):
+                    out.append(raw.decode("utf-8", errors="ignore").rstrip("\n"))
+                if head and f.tell() >= 1 << 20:
+                    f.seek(size - SWEEP_SCAN)
+                    f.readline()
+                    head = False
+    except (OSError, ValueError):
+        return []
+    return out
+
+
+def _sweep_lines(path, session_id, lines=None):
+    """[(time, hook event, entrypoint, ids)]: each time the session's own transcript records that Claude Code took
+    the line from a hook as a message for the user (its hook_system_message attachment, stamped when the hook
+    answered, after the prompt that set the hook off: 0.07 s and 5.2 s in the desktop app, 2026-11-10). lines:
+    _desk_scan's, when already read."""
+    out = []
+    for line in _desk_scan(path, session_id) if lines is None else lines:
+        if '"hook_system_message"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+            at = _iso_ts(d)
+        except (ValueError, TypeError):
+            continue
+        a = d.get("attachment") if isinstance(d, dict) else None
+        text = a.get("content") if isinstance(a, dict) and a.get("type") == "hook_system_message" else None
+        m = SWEEP_LINE_RE.match(text) if isinstance(text, str) and at is not None else None
+        if m:
+            out.append((at, a.get("hookEvent"), d.get("entrypoint"), [int(i) for i in re.findall(r"\d+", m.group(1))]))
+    return out
+
+
+START_READ = 5.0  # seconds after a start's line is stamped before a turn counts. The terminal app (2.1.322) was seen
+# to stamp the line at the start (12 s before the first typed prompt) and, in another run, with the first prompt
+# (0.01 s before it: the start hook was still running when the prompt was typed); and a first prompt may be the one
+# given on the command line (`claude "fix the build"`), sent before the line could be read (review 2026-11-10). So
+# a first prompt stamped with the line tells no one, and a later turn does
+# Not the user typing, though untagged or tagged human: Claude Code's own interrupt line, and a scheduled task's or a
+# channel's prompt (a desktop build of September 2026 tagged those human; access.typed_source refuses them too)
+NOT_TYPED_RE = re.compile(r"\s*(?:\[Request interrupted by user(?: for tool use)?\]\s*\Z|<(?:scheduled-task|channel|cron)\b)")
+
+
+def sweep_seen(db, session_id, transcript):
+    """A session's Stop hook: the user has been told of a memory the sweep hid once the session's own transcript
+    holds the line as Claude Code took it from a hook (_sweep_lines) and, after it, a turn the user typed (_typed_turns,
+    as a typed command is checked; never NOT_TYPED_RE), at the time of that turn (a session may be
+    left open for weeks). Only the transcript counts: a record made when a hook was called told whoever could call
+    one (review 2026-11-10: a forged start or prompt made the prompt that brought the line up tell). A start's line
+    counts only in the terminal app (start_shows, by the line's own entrypoint) and only for a turn START_READ
+    after its stamp, so not the session's first prompt; a prompt's line for any turn after it, so never the prompt
+    that brought it up, nor a turn before it.
+    The memories the line named, hidden as they now stand when it was given (not one restored and hidden again
+    since), start their SWEEP_EXPIRY then. Never a headless run. True if anyone was told of anything new."""
+    if headless():
+        return False
+    told = _sweep_told(db)
+    if not set(swept(db)) - set(told):
+        return False
+    if str(session_id) not in _meta_json(db, "sweep_shown", {}):  # never given the line: its transcript is not read
+        return False
+    lines = _desk_scan(transcript, session_id)
+    notices = _sweep_lines(transcript, session_id, lines)
+    if not notices:
+        return False
+    turns = [t for t, _, text in _typed_turns(transcript, session_id, "desk", lines)
+             if t is not None and not NOT_TYPED_RE.match(text)]
+    with db:
+        held = dict(db.execute("select ref, at from forget_holds where kind = 'memory' and client = ?", (SWEEP_HOLDS,)).fetchall())
+        new = {}
+        for at, event, entry, ids in notices:
+            if event == "SessionStart" and entry == "cli":
+                typed = [t for t in turns if t > at + START_READ]
+            elif event == "UserPromptSubmit":
+                typed = [t for t in turns if t > at]
+            else:
+                continue
+            for i in ids if typed else ():
+                if i in held and held[i] <= at and i not in told:
+                    new[i] = min(new.get(i, typed[0]), min(typed))
+        if not new:
+            return False
+        db.execute("insert or replace into meta(key, value) values ('sweep_told', ?)",
+                   (json.dumps({str(i): [held[i], t] for i, t in {**new, **told}.items() if i in held}),))
+    return True
+
+
 def app_forget(db, mid, client, scope=None, now=None):
     """An app's forget (see above): (ids held, the reply). mid: a memory id, or "c12" for a claim."""
     now = time.time() if now is None else now
@@ -3403,12 +3764,7 @@ def app_forget(db, mid, client, scope=None, now=None):
         vecs.update(_vectors(db, gone[1:]))
         claims = _claims_mod().hold_near(_self(), db, gone, vecs, scope) if _claims_ready(db) else []
         for m in gone:
-            if m in vecs:
-                forgot_put(db, "forgot_vec", m, vecs[m])  # not saved again meanwhile
-            db.execute("update memories set status = 'held' where id = ?", (m,))
-            db.execute("delete from chunks where memory_id = ?", (m,))  # out of search; mem_vec stays for the purge
-            db.execute("insert or replace into forget_holds values ('memory', ?, ?, ?, ?, ?)",
-                       (m, client, now, json.dumps(claims if m == mid else []), scope))
+            _hold(db, m, vecs, client, now, claims if m == mid else [], scope)
     copies = f" and its copies {', '.join(f'#{m}' for m in gone[1:])}" if gone[1:] else ""
     facts = f", with {len(claims)} fact{'s' if len(claims) > 1 else ''} drawn from it," if claims else ""
     return gone, (f"Forgotten #{mid}{copies}{facts}: hidden from every app now, and deleted for good in "
@@ -3438,12 +3794,21 @@ def unhold(db, mid):
     return True
 
 
-def purge_holds(db, now=None):
+def purge_holds(db, now=None, swept=None):
     """What apps forgot more than APP_FORGET_HOLD ago is deleted for good, as the user's forget does (forget_ids,
-    backups included). Returns the memory ids deleted."""
+    backups included); and what the claims sweep hid (hold_swept), SWEEP_EXPIRY after the user was first told of it
+    (sweep_notice: one nobody was told of stays). swept, a memory id: only that one of the sweep's, now, because
+    the user is deleting it themselves (forget_reply). Returns the memory ids deleted."""
     now = time.time() if now is None else now
     try:
-        rows = db.execute("select * from forget_holds where at < ? order by at", (now - APP_FORGET_HOLD,)).fetchall()
+        mine = db.execute("select * from forget_holds where kind = 'memory' and client = ?", (SWEEP_HOLDS,)).fetchall()
+        if swept is not None:
+            rows = [r for r in mine if r["ref"] == swept]
+        else:
+            told = _sweep_told(db)
+            rows = db.execute("select * from forget_holds where at < ? and coalesce(client, '') != ? order by at",
+                              (now - APP_FORGET_HOLD, SWEEP_HOLDS)).fetchall()
+            rows += [r for r in mine if told.get(r["ref"], now) < now - SWEEP_EXPIRY]
     except sqlite3.OperationalError:  # none ever made
         return []
     out = []
@@ -3457,6 +3822,9 @@ def purge_holds(db, now=None):
                 if row is not None:
                     gone = [r["ref"]]
                     words = [row[0]]
+                    if r["client"] == SWEEP_HOLDS:  # an app's hold got its fingerprint when held; reindex drops
+                        vec = _vectors(db, gone).get(r["ref"])  # a held memory's vector: then from its text
+                        forgot_put(db, "forgot_vec", r["ref"], vec if vec is not None else embed([row[0]])[0])
                     forget_handoffs(db, [row[0]], scope)
                     drop_derived(db, [row[0]], scope)  # only what the app's own scope may see
                     merged = [x for x in _merged_into(db, gone) if x in _visible(db, [x], scope)]
@@ -8276,6 +8644,16 @@ def hook_prompt(data):
                 db.close()
         except Exception as e:
             print(f"{SERVER_NAME}: typed commands not checked: {e}", file=sys.stderr)
+    if who == ("desk", True) and data.get("session_id") and not start_shows() and not headless() \
+            and scope_of(data["session_id"]) is None and _sweep_due(data["session_id"]):
+        try:  # what the claims sweep hid, where a start's words are not shown (the desktop app)
+            db = connect()
+            try:
+                say[:0] = [x for x in (sweep_notice(db, data["session_id"]),) if x]  # first: SWEEP_LINE_RE
+            finally:
+                db.close()
+        except Exception as e:  # never cost the user their prompt or their recall
+            print(f"{SERVER_NAME}: sweep notice not given: {e}", file=sys.stderr)
     ins = _instant()
     if INSTANT_MODE == "on" and (ins.fact_of(req["prompt"]) or ins.confirm_of(req["prompt"])
                                  or ins.forget_of(req["prompt"])):
@@ -8372,7 +8750,7 @@ def hook_session_start(data):
                 db.execute("delete from claim_injections where session_id = ?", (data.get("session_id"),))
         db.execute("delete from injections where at < ?", (time.time() - 30 * 86400,))
     auto_import(db)
-    recent = ""
+    recent, say = "", ""
     who, _ = hook_client(data)  # Claude Code's block only on its own transcript (hook_client)
     if INSTANT_MODE == "on" and data.get("source") in ("startup", "clear", "compact"):
         if who == ("desk", True):  # Claude Code at the desk: the project's lessons and recent saves
@@ -8381,6 +8759,7 @@ def hook_session_start(data):
                 if scope_of(data.get("session_id")) is None else ""
             if data.get("source") != "compact" and scope_of(data.get("session_id")) is None:
                 recent = "\n\n".join(x for x in (recent, held_notice(db)) if x)
+                say = sweep_notice(db, data.get("session_id")) if start_shows() else ""  # else: with a prompt
         elif data.get("source") != "compact":  # Codex (its SessionStart), or any other: what it may see of the latest
             recent = _recent_block(db, data.get("cwd"), who)
     text = None
@@ -8393,8 +8772,9 @@ def hook_session_start(data):
             print(f"{SERVER_NAME}: no where-you-left-off block: {e}", file=sys.stderr)
             text = None
     text = "\n\n".join(x for x in (recent, text) if x)  # recent saves ahead of where you left off
-    if text:
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+    if text or say:  # say: for the user's screen, not the model's context (sweep_notice)
+        print(json.dumps({**({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+                             if text else {}), **({"systemMessage": say} if say else {})}))
 
 
 def held_notice(db, now=None):
@@ -8463,6 +8843,10 @@ def hook_activity(data, final=False):
         say = []
     if say:
         print(json.dumps({"systemMessage": "\n".join(say)}))
+    try:  # the line about what the claims sweep hid, if this session's start showed it and they have typed since
+        sweep_seen(db, data["session_id"], data["transcript_path"])
+    except Exception as e:
+        print(f"{SERVER_NAME}: sweep notice not checked: {e}", file=sys.stderr)
     with db:
         db.execute("insert into sessions(session_id, transcript, cwd, activity, final) values (?,?,?,?,?)"
                    " on conflict(session_id) do update set transcript=excluded.transcript,"
@@ -8826,6 +9210,19 @@ def forget_reply(db, mid, scope=None):
     if not _visible(db, [mid], scope):
         return f"no active memory #{mid}"
     vec = _vectors(db, [mid]).get(mid)
+    if swept(db, mid):  # hidden since a forget they asked for in conversation (hold_swept): this deletes it now,
+        # with its exact copies, as forget_ids does (one saved again while it was hidden is active)
+        content, src = db.execute("select content, source from memories where id = ?", (mid,)).fetchone()
+        vec = vec if vec is not None else embed([content])[0]  # reindex drops a held memory's vector
+        copies = [m for m, _ in _near_active(db, vec, DUP_SIM, skip={mid}, scope=scope)]
+        if purge_holds(db, swept=mid):
+            copies = sorted({g for c in copies for g in forget_ids(db, c, scope)})  # each forget takes its own copies
+            return (f"Deleted #{mid}" + (f" and its copies {', '.join(f'#{m}' for m in copies)}" if copies else "")
+                    + " for good: its text, the older versions merged into it and its search entries, in the store "
+                    "and its backups. It had been hidden since you asked to forget something. Kept: a fingerprint "
+                    "with no words, so it is not saved again from an old chat. This cannot be undone."
+                    + (f" It was imported from {src}, which still holds it: delete it there too."
+                       if src and not str(src).startswith("meeting:") else ""))
     rep = {}
     gone = forget_ids(db, mid, scope, report=rep)
     if gone:
@@ -9259,6 +9656,10 @@ def main():
     elif cmd == "forget":
         if run_by_agent() or _access().agent_ancestor() is not None:  # an AI app's shell (its env, or its process
             # tree, which clearing the env does not leave; unreadable counts as one): the app's forget, held a day
+            if args[1][:1] not in "cC" and swept(db, int(args[1])):  # what the user's own forget request hid
+                print(f"#{args[1]} is hidden already because you asked to forget something: only you can delete it "
+                      f"now, at a Terminal an AI app did not start, or by typing: forget memory {args[1]}")
+                sys.exit(1)  # nothing was forgotten: a script, or `&&`, can tell (as below)
             said = app_forget(db, args[1] if args[1][:1] in "cC" else int(args[1]), "a command an app ran")[1]
         else:  # the user, at a Terminal: deleted now, for good
             said = forget_reply(db, args[1] if args[1][:1] in "cC" else int(args[1]))
@@ -9269,6 +9670,11 @@ def main():
         ok = unhold(db, args[1])
         print(f"restored {args[1]}" if ok else f"{args[1]} is not waiting to be deleted")
         sys.exit(0 if ok else 1)
+    elif cmd == "restore" and under_swept(db, int(args[1])) and (run_by_agent()
+                                                                  or _access().agent_ancestor() is not None):
+        print(f"#{args[1]} was hidden because you asked to forget something: only you can bring it back, at a "
+              "Terminal an AI app did not start")  # as `forget` above: an app's shell is the app's
+        sys.exit(1)
     elif cmd == "restore":
         if db.execute("select 1 from memories where id = ? and status = 'active'", (int(args[1]),)).fetchone():
             print(f"#{args[1]} was not forgotten: there is nothing to restore")
